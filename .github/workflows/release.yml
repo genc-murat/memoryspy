@@ -1,0 +1,72 @@
+# Windows release build.
+#
+# The shipped artifact is the Tauri installer, and the one thing that makes it more than a
+# Rust + frontend build is the .NET collector: it is not linked into the app, it is published
+# self-contained (the .NET runtime travels inside the installer, so the target machine needs
+# no dotnet) into `src-tauri/resources/collector` before `tauri build`, and Tauri's
+# `bundle.resources` mapping then carries it inside the installer as `collector/`. At startup
+# the app resolves its resource directory and points `locate_collector` at it — so a release
+# built without that step installs fine and cannot attach to anything.
+#
+# Runs on every push of a `v*` tag (the release cut) and on demand (a pipeline test that
+# uploads the installers as workflow artifacts instead of touching releases).
+name: Release (Windows)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The collector targets net10.0 and speaks to the profiled process through the .NET 10
+      # diagnostics stack, so the SDK major must match the csproj.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Publish the collector into the bundle resources
+        run: npm run collector:publish
+
+      # `beforeBuildCommand` runs `npm run build` (tsc + vite) itself; on Windows this
+      # produces the NSIS setup and the MSI under src-tauri/target/release/bundle.
+      - name: Build the app
+        run: npm run tauri build
+
+      - name: Upload installers as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: memoryspy-windows-x64
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Attach installers to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi

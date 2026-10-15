@@ -29,8 +29,10 @@ büyüyor**.
 
 ## Hızlı başlangıç
 
-Gereksinimler: .NET SDK 8+ (`dotnet --version`), Node 20+, Rust toolchain, macOS'ta Xcode
-Command Line Tools.
+Gereksinimler: .NET SDK 10+ (`dotnet --version`), Node 20+, Rust toolchain, macOS'ta Xcode
+Command Line Tools. Bunlar kaynaktan derlemek için; kurulan uygulamada collector
+self-contained publish edilir ve .NET runtime'ı installer'ın içinde taşındığı için hedef
+makinede `dotnet` gerekmez.
 
 ```bash
 npm install

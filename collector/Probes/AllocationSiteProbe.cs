@@ -30,8 +30,12 @@ namespace MemorySpy.Collector.Probes;
 /// <list type="bullet">
 /// <item>The older <c>GCSampledObjectAllocation</c> mechanism
 /// (<c>GCAllObjectAllocation</c> = <c>0x2200000</c>, the one PerfView-era tooling uses)
-/// produces <em>nothing at all</em> on .NET 10, so this probe uses the modern keyword. It can
-/// still read the old event if a capture from an older runtime is fed to it.</item>
+/// produces <em>nothing at all</em> on .NET 10, but it is the <em>only</em> mechanism on
+/// older runtimes: a real capture from a .NET 7.0.3 process holds 16 443 allocation ticks
+/// and not one sampled allocation, because a runtime silently ignores a keyword bit it has
+/// never heard of. So the probe requests <em>both</em> keywords — each one is inert exactly
+/// where the other works, and the analysis reads whichever event the runtime actually
+/// produced.</item>
 /// <item>TraceEvent cannot resolve a call stack on a live <c>EventPipeEventSource</c> — it
 /// throws "Attempted to use TraceLog support on a non-TraceLog TraceEventSource" — because
 /// instruction pointers can only be turned into method names once the module and method maps
@@ -72,9 +76,20 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     /// <summary>
     /// <c>ClrTraceEventParser.Keywords.AllocationSampling</c>. Verified against TraceEvent
     /// 4.0.0's own enum rather than assumed: it is the flag that turns on sampled allocation
-    /// events that carry call stacks.
+    /// events that carry call stacks. .NET 10 and later only — an older runtime ignores the
+    /// bit and emits nothing for it.
     /// </summary>
     private const long KeywordAllocationSampling = 0x80000000000;
+
+    /// <summary>
+    /// <c>ClrTraceEventParser.Keywords.GCAllObjectAllocation</c>, likewise verified against
+    /// TraceEvent 4.0.0's enum: the sampled-allocation mechanism of .NET Core 3+ before 10.
+    /// Requested alongside the modern keyword because a runtime ignores what it does not
+    /// know — the measured proof is a .NET 7.0.3 capture taken with only the modern bit
+    /// armed: 16 443 allocation ticks, zero sampled allocations. On .NET 10 this legacy bit
+    /// is the keyword that produces nothing, so requesting both is safe in both directions.
+    /// </summary>
+    private const long KeywordGCAllObjectAllocation = 0x2200000;
 
     /// <summary>Stop walking a stack after this many frames; deeper frames are noise.</summary>
     private const int MaxStackDepth = 32;
@@ -176,16 +191,21 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     public IReadOnlyList<string> EventTypes { get; } = new[] { MessageType.AllocationSite };
 
     /// <summary>
-    /// The sampler provider. It is only merged into the session when the user asked for a
-    /// capture: at tens of thousands of events per second it is far too expensive to run
-    /// silently for everyone.
+    /// Both sampled-allocation keywords, merged into one provider. The runtime keeps the one
+    /// it knows and ignores the other, so the same request covers .NET Core 3+ through 9
+    /// (legacy events) and .NET 10+ (modern events) without knowing the target's version up
+    /// front — and the analysis reads whichever the capture actually holds.
+    ///
+    /// It is only merged into the session when the user asked for a capture (see
+    /// <c>CollectorSession.Run</c>): at tens of thousands of events per second it is far too
+    /// expensive to run silently for everyone.
     /// </summary>
     public IReadOnlyList<EventPipeProvider> CreateProviders() => new[]
     {
         new EventPipeProvider(
             "Microsoft-Windows-DotNETRuntime",
             EventLevel.Verbose,
-            keywords: KeywordAllocationSampling),
+            keywords: KeywordAllocationSampling | KeywordGCAllObjectAllocation),
     };
 
     public string CaptureExtension => "nettrace";
@@ -209,13 +229,14 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     public IReadOnlyDictionary<string, object?> Describe() => new Dictionary<string, object?>
     {
         ["provider"] = "Microsoft-Windows-DotNETRuntime",
-        ["event"] = "AllocationSampling",
-        ["keywords"] = "AllocationSampling (0x80000000000)",
+        ["event"] = "AllocationSampling (.NET 10+) / GCAllObjectAllocation (3+ to 9)",
+        ["keywords"] = "AllocationSampling (0x80000000000) | GCAllObjectAllocation (0x2200000)",
         ["timing"] = "post-session",
         ["requiresCapture"] = true,
         ["notes"] = new[]
         {
             "Call stacks cannot be resolved on a live EventPipe stream, so this probe needs the raw stream written to a .nettrace and answers once the session stops.",
+            "Both sampled-allocation keywords are requested and the runtime keeps the one it knows: AllocationSampling on .NET 10 and later, GCAllObjectAllocation from .NET Core 3 through 9. A runtime silently ignores a keyword bit it has never heard of, which is why only one was not enough.",
             "Allocation events carry the managed call stack, resolved to method names, including frames inside the runtime — which is what makes framework types actionable.",
             "Source lines come from each module's PDB: the code address yields the method, and the PDB is read again to turn its IL offset into a file and line. PDBs are looked up next to the assemblies, and through _NT_SYMBOL_PATH when it is set (which is what enables a symbol server; nothing is downloaded otherwise).",
             "When a module's PDB cannot be found, its sites fall back to the method name and are counted in sitesWithoutSource, with the module reported in modulesWithoutSource.",
@@ -273,6 +294,9 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
             result.ConversionMs = conversionMs;
             result.AnalysisMs = Environment.TickCount64 - analysisStarted;
 
+            if (result.SampledEvents == 0)
+                ReportZeroSamples(result, context);
+
             var payload = BuildPayload(result, capturePath, info.Length, resolver);
 
             // The intermediate is removed before the result is announced, so that by the time a
@@ -297,6 +321,32 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
         {
             DeleteEtlx(log, context, ref etlxPath);
         }
+    }
+
+    /// <summary>
+    /// Says out loud what an empty answer means, because "0 call sites" is otherwise
+    /// indistinguishable from "the feature is broken".
+    ///
+    /// The evidence is in the capture itself: allocation ticks that kept firing prove the
+    /// process was allocating and the session was live, so the empty result is the sampler
+    /// mechanism, not the target going quiet — and the rundown names the runtime that ignored
+    /// whichever keyword it did not know. Measured case in point: a .NET 7.0.3 capture armed
+    /// with only the modern keyword held 16 443 ticks and not one sampled allocation.
+    /// </summary>
+    private static void ReportZeroSamples(AnalysisResult result, ProbeContext context)
+    {
+        var runtime = result.RuntimeVersion is { } version
+            ? $" The capture was written by runtime {version}."
+            : string.Empty;
+
+        context.Log(
+            "warn",
+            "The capture holds no sampled allocation events, so there are no call sites to " +
+            $"report — it holds {result.AllocationTickEvents:N0} GC/AllocationTick events, so the " +
+            "process was allocating but the runtime produced no samples. Both sampled-allocation " +
+            "keywords were requested: AllocationSampling (.NET 10+) and GCAllObjectAllocation " +
+            "(.NET Core 3+ to 9), so an empty capture on this build means the runtime predates " +
+            "sampled allocations or has them disabled by configuration." + runtime);
     }
 
     /// <summary>
@@ -434,6 +484,17 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
         public long ConversionMs;
         public long AnalysisMs;
         public long FrameworkOnlySites;
+
+        /// <summary>
+        /// GC/AllocationTick events seen while folding, which is how a capture that produced
+        /// no sampled allocations is told apart from one that measured nothing: ticks mean the
+        /// process was allocating and the session was live, so the sampler mechanism is what
+        /// failed — that is the zero-samples warning's whole evidence.
+        /// </summary>
+        public long AllocationTickEvents;
+
+        /// <summary>The version directory of the runtime that wrote the capture, if its CoreLib is named.</summary>
+        public string? RuntimeVersion;
     }
 
     private sealed class TypeTotals
@@ -779,12 +840,28 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     {
         var result = new AnalysisResult();
 
+        // The capture is the evidence of what runtime wrote it: the rundown names CoreLib, and
+        // its containing directory is the runtime's version folder (…\Microsoft.NETCore.App\7.0.3\).
+        // Read once, up front, so a zero-sample diagnosis can say what was attached to.
+        result.RuntimeVersion = log.ModuleFiles
+            .OfType<TraceModuleFile>()
+            .Select(m => m.FilePath)
+            .FirstOrDefault(p => p is not null &&
+                                 p.Contains("System.Private.CoreLib", StringComparison.OrdinalIgnoreCase))
+            is { } coreLibPath
+                ? Path.GetFileName(Path.GetDirectoryName(coreLibPath))
+                : null;
+
         foreach (var ev in log.Events)
         {
             var isModern = ev.EventName.Contains("AllocationSampling", StringComparison.Ordinal);
             var isLegacy = !isModern && ev.EventName.Contains("SampledObjectAllocation", StringComparison.Ordinal);
             if (!isModern && !isLegacy)
+            {
+                if (ev.EventName.Contains("AllocationTick", StringComparison.Ordinal))
+                    result.AllocationTickEvents++;
                 continue;
+            }
 
             var typeName = ReadString(ev, "TypeName");
             if (string.IsNullOrWhiteSpace(typeName))
@@ -1055,6 +1132,8 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
             captureBytes,
             eventsScanned = result.SampledEvents,
             sampledEvents = result.SampledEvents,
+            allocationTickEvents = result.AllocationTickEvents,
+            runtimeVersion = result.RuntimeVersion,
             totalSampledBytes = result.TotalBytes,
             totalSamples = result.SampledEvents,
             largeObjectSamples = result.LargeObjectSamples,

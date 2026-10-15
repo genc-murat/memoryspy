@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit",
     "collector:build": "dotnet build collector -c Debug",
     "collector:release": "dotnet build collector -c Release",
-    "collector:publish": "dotnet publish collector -c Release -o src-tauri/resources/collector",
+    "collector:publish": "node scripts/publish-collector.mjs",
     "sample:build": "dotnet build samples/LeakyCache -c Debug",
     "sample:run": "dotnet run --project samples/LeakyCache --",
     "app:dev": "tauri dev",

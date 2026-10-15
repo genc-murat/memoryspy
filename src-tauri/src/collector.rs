@@ -146,15 +146,73 @@ const MESSAGE_BATCH_INTERVAL: Duration = Duration::from_millis(80);
 #[serde(rename_all = "camelCase")]
 pub struct CollectorLocation {
     pub found: bool,
-    /// Path to the `dotnet` host executable.
+    /// Path to the `dotnet` host executable. Reported even for a self-contained layout, but
+    /// only *needed* when [`Self::executable_path`] is absent.
     pub dotnet_path: Option<String>,
     /// Path to MemorySpy.Collector.dll.
     pub assembly_path: Option<String>,
+    /// Path to a self-contained `MemorySpy.Collector` executable sitting beside the
+    /// assembly. When set, the collector carries its own .NET runtime inside the publish
+    /// output and is launched directly: the target machine needs no `dotnet` installed.
+    pub executable_path: Option<String>,
     /// How the path was resolved: env | resource | build-output | missing.
     pub source: String,
     pub dotnet_version: Option<String>,
     pub searched: Vec<String>,
     pub error: Option<String>,
+}
+
+/// The native executable a self-contained publish leaves beside the assembly.
+const COLLECTOR_EXECUTABLE: &str = if cfg!(windows) {
+    "MemorySpy.Collector.exe"
+} else {
+    "MemorySpy.Collector"
+};
+
+/// The native executable beside the assembly, when the layout is self-contained.
+fn sibling_executable(dir: &Path) -> Option<PathBuf> {
+    let candidate = dir.join(COLLECTOR_EXECUTABLE);
+    candidate.is_file().then_some(candidate)
+}
+
+/// What to launch to run the collector: the program and its leading arguments.
+///
+/// A self-contained publish ships a native executable that carries its own .NET runtime, so
+/// when one sits beside the assembly the program is that executable and it needs no leading
+/// argument; a framework-dependent layout launches through `dotnet` with the assembly as the
+/// first argument. Either way the caller appends its subcommand (`list`, `capabilities`,
+/// `watch`) exactly as before.
+fn resolve_launch(location: &CollectorLocation) -> Result<(String, Vec<String>), String> {
+    if let Some(executable) = &location.executable_path {
+        return Ok((executable.clone(), Vec::new()));
+    }
+
+    let missing_dotnet = |assembly: &String| {
+        format!(
+            "The collector at {assembly} is framework-dependent, but no dotnet executable was \
+             found. Install the .NET runtime, point MEMORYSPY_DOTNET at one, or publish the \
+             collector self-contained."
+        )
+    };
+
+    let dotnet = location.dotnet_path.clone().ok_or_else(|| {
+        location
+            .assembly_path
+            .as_ref()
+            .map(missing_dotnet)
+            .unwrap_or_else(|| {
+                location
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "The collector is not available.".to_string())
+            })
+    })?;
+    let assembly = location
+        .assembly_path
+        .clone()
+        .ok_or_else(|| "The collector assembly was not recorded.".to_string())?;
+
+    Ok((dotnet, vec![assembly]))
 }
 
 pub fn locate_collector() -> CollectorLocation {
@@ -168,10 +226,15 @@ pub fn locate_collector() -> CollectorLocation {
         let path = PathBuf::from(&explicit);
         searched.push(explicit.clone());
         if path.is_file() {
+            let executable = path
+                .parent()
+                .and_then(sibling_executable)
+                .map(|p| p.to_string_lossy().into_owned());
             return CollectorLocation {
                 found: true,
                 dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
                 assembly_path: Some(path.to_string_lossy().into_owned()),
+                executable_path: executable,
                 source: "env".into(),
                 dotnet_version,
                 searched,
@@ -190,25 +253,40 @@ pub fn locate_collector() -> CollectorLocation {
     // 3. Development build output relative to the crate, so `npm run tauri dev` just works
     //    after `npm run collector:build`.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent().map(Path::to_path_buf).unwrap_or(manifest_dir);
+    let repo_root = manifest_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(manifest_dir);
     for config in ["Debug", "Release"] {
         candidates.push((
-            repo_root.join("collector").join("bin").join(config).join("net10.0"),
+            repo_root
+                .join("collector")
+                .join("bin")
+                .join(config)
+                .join("net10.0"),
             "build-output",
         ));
     }
 
     // 4. A published collector staged for packaging.
-    candidates.push((repo_root.join("src-tauri").join("resources").join("collector"), "resource"));
+    candidates.push((
+        repo_root
+            .join("src-tauri")
+            .join("resources")
+            .join("collector"),
+        "resource",
+    ));
 
     for (dir, source) in candidates {
         let candidate = dir.join(COLLECTOR_ASSEMBLY);
         searched.push(candidate.to_string_lossy().into_owned());
         if candidate.is_file() {
+            let executable = sibling_executable(&dir).map(|p| p.to_string_lossy().into_owned());
             return CollectorLocation {
                 found: true,
                 dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
                 assembly_path: Some(candidate.to_string_lossy().into_owned()),
+                executable_path: executable,
                 source: source.into(),
                 dotnet_version,
                 searched,
@@ -221,6 +299,7 @@ pub fn locate_collector() -> CollectorLocation {
         found: false,
         dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
         assembly_path: None,
+        executable_path: None,
         source: "missing".into(),
         dotnet_version,
         searched,
@@ -266,7 +345,11 @@ fn find_dotnet() -> Option<PathBuf> {
         }
     }
 
-    let exe = if cfg!(windows) { "dotnet.exe" } else { "dotnet" };
+    let exe = if cfg!(windows) {
+        "dotnet.exe"
+    } else {
+        "dotnet"
+    };
 
     // DOTNET_ROOT is the conventional install location for a private .NET runtime.
     if let Ok(root) = std::env::var("DOTNET_ROOT") {
@@ -330,12 +413,15 @@ struct ProcessListData {
 }
 
 /// Runs the collector in its one-shot `list` mode and returns the parsed result.
-pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<DotnetProcessInfo>, String> {
-    let (dotnet, assembly) = resolve_or_err(location)?;
+pub fn list_processes(
+    location: &CollectorLocation,
+    fast: bool,
+) -> Result<Vec<DotnetProcessInfo>, String> {
+    let (dotnet, arguments) = resolve_launch(location)?;
 
     let mut command = Command::new(dotnet);
     command
-        .arg(assembly)
+        .args(arguments)
         .arg("list")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -360,8 +446,10 @@ pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<Do
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             if value.get("type").and_then(|t| t.as_str()) == Some("process.list") {
                 if let Some(data) = value.get("data") {
-                    let parsed: ProcessListData = serde_json::from_value(data.clone())
-                        .map_err(|e| format!("Collector returned an unexpected process list: {e}"))?;
+                    let parsed: ProcessListData =
+                        serde_json::from_value(data.clone()).map_err(|e| {
+                            format!("Collector returned an unexpected process list: {e}")
+                        })?;
                     return Ok(parsed.processes);
                 }
             }
@@ -371,17 +459,21 @@ pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<Do
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!(
         "The collector did not return a process list. {}",
-        if stderr.trim().is_empty() { "No error output was produced.".to_string() } else { stderr.trim().to_string() }
+        if stderr.trim().is_empty() {
+            "No error output was produced.".to_string()
+        } else {
+            stderr.trim().to_string()
+        }
     ))
 }
 
 /// Runs the collector's `capabilities` command so the UI can build panels dynamically.
 pub fn fetch_capabilities(location: &CollectorLocation) -> Result<serde_json::Value, String> {
-    let (dotnet, assembly) = resolve_or_err(location)?;
+    let (dotnet, arguments) = resolve_launch(location)?;
 
     let mut command = Command::new(dotnet);
     command
-        .arg(assembly)
+        .args(arguments)
         .arg("capabilities")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -399,22 +491,15 @@ pub fn fetch_capabilities(location: &CollectorLocation) -> Result<serde_json::Va
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             if value.get("type").and_then(|t| t.as_str()) == Some("hello") {
-                return Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null));
+                return Ok(value
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
             }
         }
     }
 
     Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-}
-
-fn resolve_or_err(location: &CollectorLocation) -> Result<(String, String), String> {
-    match (&location.dotnet_path, &location.assembly_path) {
-        (Some(dotnet), Some(assembly)) => Ok((dotnet.clone(), assembly.clone())),
-        _ => Err(location
-            .error
-            .clone()
-            .unwrap_or_else(|| "The collector is not available.".to_string())),
-    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -597,11 +682,15 @@ impl SessionHandle {
     /// Sends a command object to the collector's stdin.
     pub fn send_command(&self, command: serde_json::Value) -> Result<(), String> {
         let mut guard = self.0.stdin.lock().unwrap();
-        let stdin = guard.as_mut().ok_or_else(|| "The session has no open stdin.".to_string())?;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| "The session has no open stdin.".to_string())?;
 
         let line = serde_json::to_string(&command).map_err(|e| e.to_string())?;
         writeln!(stdin, "{line}").map_err(|e| format!("Could not write to the collector: {e}"))?;
-        stdin.flush().map_err(|e| format!("Could not flush the collector command: {e}"))
+        stdin
+            .flush()
+            .map_err(|e| format!("Could not flush the collector command: {e}"))
     }
 
     /// Asks the collector to stop cleanly, then force kills it if it does not comply.
@@ -613,7 +702,8 @@ impl SessionHandle {
     /// tracing code, on the deadline the session was started with.
     pub fn stop(&self) {
         self.0.stop_requested.store(true, Ordering::SeqCst);
-        self.0.set_state(SessionState::Stopping, Some("Stop requested.".into()));
+        self.0
+            .set_state(SessionState::Stopping, Some("Stop requested.".into()));
 
         let _ = self.send_command(serde_json::json!({ "cmd": "stop" }));
 
@@ -712,7 +802,7 @@ pub fn start_session(
     request: SessionRequest,
     recordings_dir: Option<PathBuf>,
 ) -> Result<SessionHandle, String> {
-    let (dotnet, assembly) = resolve_or_err(location)?;
+    let (dotnet, arguments) = resolve_launch(location)?;
 
     if request.pid <= 0 {
         return Err("A valid process id is required.".into());
@@ -722,11 +812,7 @@ pub fn start_session(
     let max_types = request.max_types.unwrap_or(150).max(10);
 
     let recorder = if request.record || request.record_path.is_some() {
-        Some(open_recording(
-            &request,
-            recordings_dir.as_deref(),
-            false,
-        )?)
+        Some(open_recording(&request, recordings_dir.as_deref(), false)?)
     } else {
         None
     };
@@ -738,14 +824,18 @@ pub fn start_session(
             .as_deref()
             .ok_or_else(|| "No capture directory is available for a deep capture.".to_string())?;
         fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-        Some(dir.join(format!("capture-{}-{}.nettrace", request.pid, now_unix_ms())))
+        Some(dir.join(format!(
+            "capture-{}-{}.nettrace",
+            request.pid,
+            now_unix_ms()
+        )))
     } else {
         None
     };
 
     let mut command = Command::new(dotnet);
     command
-        .arg(assembly)
+        .args(arguments)
         .arg("watch")
         .arg("--pid")
         .arg(request.pid.to_string())
@@ -775,8 +865,14 @@ pub fn start_session(
         .spawn()
         .map_err(|e| format!("Failed to start the collector process: {e}"))?;
 
-    let stdout = child.stdout.take().ok_or("The collector produced no stdout.")?;
-    let stderr = child.stderr.take().ok_or("The collector produced no stderr.")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("The collector produced no stdout.")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("The collector produced no stderr.")?;
     let stdin = child.stdin.take();
 
     let session_id = format!("pid{}-{}", request.pid, now_unix_ms());
@@ -835,7 +931,9 @@ fn open_recording(
     });
 
     match request.record_path.as_deref() {
-        Some(path) => RecordingWriter::create_at(Path::new(path), target, options, started_mid_session),
+        Some(path) => {
+            RecordingWriter::create_at(Path::new(path), target, options, started_mid_session)
+        }
         None => {
             let dir = recordings_dir.ok_or_else(|| {
                 "No recordings directory is available; pass an explicit recording path.".to_string()
@@ -850,7 +948,11 @@ fn open_recording(
 /// Batching is not cosmetic: a heavily collecting runtime emits hundreds of GC and
 /// allocation events per second, and one IPC round trip per event would saturate the webview
 /// while adding nothing the UI can render (it repaints at most once per frame).
-fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout: std::process::ChildStdout) {
+fn spawn_stdout_pump(
+    sink: Arc<dyn EventSink>,
+    inner: Arc<SessionInner>,
+    stdout: std::process::ChildStdout,
+) {
     // A dedicated reader thread feeds lines into a channel so this thread can flush a stale
     // batch on a deadline. Reading stdout directly would block, and a blocking read holds the
     // first messages of a quiet session hostage until the *next* line arrives: a probe set
@@ -908,7 +1010,10 @@ fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout:
 
             inner.stats.messages.fetch_add(1, Ordering::Relaxed);
 
-            let message_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+            let message_type = value
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown");
             if let Ok(mut counts) = inner.message_counts.lock() {
                 *counts.entry(message_type.to_string()).or_insert(0) += 1;
             }
@@ -918,13 +1023,19 @@ fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout:
                     inner.stats.counters.fetch_add(1, Ordering::Relaxed);
                 }
                 "allocation.sample" => {
-                    inner.stats.allocation_samples.fetch_add(1, Ordering::Relaxed);
+                    inner
+                        .stats
+                        .allocation_samples
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 "gc.event" => {
                     inner.stats.gc_events.fetch_add(1, Ordering::Relaxed);
                 }
                 "target.exited" => {
-                    inner.set_state(SessionState::Stopping, Some("The target process exited.".into()));
+                    inner.set_state(
+                        SessionState::Stopping,
+                        Some("The target process exited.".into()),
+                    );
                 }
                 _ => {}
             }
@@ -950,13 +1061,17 @@ fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout:
                             None => "The collector was terminated by a signal.".to_string(),
                         });
                     }
-                    Err(e) => exit_detail = Some(format!("Could not read the collector exit status: {e}")),
+                    Err(e) => {
+                        exit_detail = Some(format!("Could not read the collector exit status: {e}"))
+                    }
                 }
             }
         }
 
         let failed = !inner.stop_requested.load(Ordering::SeqCst)
-            && exit_detail.as_deref().is_some_and(|d| !d.contains("cleanly"));
+            && exit_detail
+                .as_deref()
+                .is_some_and(|d| !d.contains("cleanly"));
 
         // The footer is written before the final status is reported, so that by the time the
         // UI believes the session has ended the file on disk is already complete.
@@ -980,13 +1095,21 @@ fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout:
         }
 
         inner.set_state(
-            if failed { SessionState::Failed } else { SessionState::Stopped },
+            if failed {
+                SessionState::Failed
+            } else {
+                SessionState::Stopped
+            },
             exit_detail,
         );
     });
 }
 
-fn spawn_stderr_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stderr: std::process::ChildStderr) {
+fn spawn_stderr_pump(
+    sink: Arc<dyn EventSink>,
+    inner: Arc<SessionInner>,
+    stderr: std::process::ChildStderr,
+) {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {

@@ -104,16 +104,16 @@ textarea {
  * one. It is replaced with a thin rail in the same graphite as the surfaces: no arrows, no track
  * fill, and a thumb that only lifts to a lighter grey under the pointer.
  *
- * Both syntaxes are set because the app runs in three webviews: the `::-webkit-scrollbar` family
- * covers WebView2 (Windows) and WKWebView (macOS), and the standard `scrollbar-*` properties cover
- * the newer Chromium path and every engine that ignores the pseudo-elements. `color-scheme: dark`
- * above is the fallback for the platforms that honour neither.
+ * Two APIs that are mutually exclusive rather than complementary. The `::-webkit-scrollbar` family
+ * is what draws on every engine this app actually runs in (WebView2 and WKWebView), but a
+ * non-`auto` `scrollbar-width` or `scrollbar-color` *disables* it. That is measured, not assumed:
+ * in the app's own webview, an element asking for a 30 px legacy scrollbar while `scrollbar-width:
+ * thin` was also set still rendered 11 px — the standard property won and the pseudo-element was
+ * inert. So the standard properties live behind `@supports not selector(::-webkit-scrollbar)`, and
+ * are applied only on an engine that has no pseudo-elements to lose (Firefox), where colour is all
+ * the control available anyway. `color-scheme: dark` above stays the floor for anything that
+ * honours neither.
  */
-
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
-}
 
 ::-webkit-scrollbar {
   width: 11px;
@@ -142,6 +142,13 @@ textarea {
 ::-webkit-scrollbar-thumb:active {
   background: var(--scrollbar-thumb-active);
   background-clip: content-box;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+  }
 }
 
 /* The two panes that are always on screen reserve their gutter, so switching to a tab whose

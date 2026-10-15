@@ -155,6 +155,23 @@ public sealed class CollectorSession : IDisposable
                 "info",
                 $"Deep capture enabled: copying the raw event stream to {capturePath}. " +
                 "Allocation call sites are resolved from that file when the session stops.");
+
+            // The size cap cannot simply cut the file: a nettrace whose tail is missing is not
+            // a smaller trace, it is no trace at all — TraceEvent refuses it wholesale and the
+            // user loses every call site to the last byte. So reaching the cap ends collection
+            // instead: the session stops itself, the runtime flushes what it holds and writes
+            // its stream epilogue, and the file stays a readable trace that covers the prefix.
+            _capture.CapReached += () =>
+            {
+                _emitter.Log(
+                    "warn",
+                    $"The capture hit its {_options.CaptureMaxBytes / (1024 * 1024)} MB size limit. " +
+                    "Collection is ending so the trace file stays readable; it covers everything " +
+                    "up to the limit. Raise --capture-max-mb for longer captures.");
+                // We are on the parser thread, inside a read of the very stream Stop() waits
+                // on — stopping from here would deadlock, so hop to the pool.
+                ThreadPool.QueueUserWorkItem(_ => RequestStop());
+            };
         }
 
         using var source = new EventPipeEventSource(eventStream);

@@ -13,9 +13,13 @@ namespace MemorySpy.Collector.Core;
 /// <list type="item">
 /// <item>a write error stops the copy and records why, but never fails the session — the
 /// live stream is the primary product and the capture is a bonus;</item>
-/// <item><see cref="MaxBytes"/> caps how much disk a long session can consume. Once the cap
-/// is hit the copy stops and <see cref="Truncated"/> becomes true, which is reported to the
-/// user instead of silently analysed as if it were complete.</item>
+/// <item><see cref="MaxBytes"/> bounds how much disk a long session can consume — but a
+/// nettrace file that is simply cut at a byte offset is not a trace any more: the format's
+/// closing sequence depends on the writer's object state, so a truncated tail makes the
+/// whole file unreadable to TraceEvent. Reaching the cap therefore only <em>flags</em> the
+/// capture (<see cref="Truncated"/>, <see cref="CapReached"/>) and keeps writing — the
+/// session stops itself in response, so the runtime's own flush and stream epilogue close
+/// the file properly and the analysis still has a readable trace covering the prefix.</item>
 /// </list>
 /// </summary>
 internal sealed class CaptureStream : Stream
@@ -24,6 +28,7 @@ internal sealed class CaptureStream : Stream
     private readonly FileStream _file;
     private readonly long _maxBytes;
     private long _written;
+    private int _capReached;
     private bool _truncated;
     private bool _disposed;
     private string? _writeError;
@@ -47,37 +52,44 @@ internal sealed class CaptureStream : Stream
     /// <summary>Bytes copied so far.</summary>
     public long Written => Interlocked.Read(ref _written);
 
+    /// <summary>The configured size limit, for messages that name it.</summary>
+    public long MaxBytes => _maxBytes;
+
     /// <summary>True when the size cap was reached and the tail of the stream was not kept.</summary>
     public bool Truncated => _truncated;
 
     /// <summary>The first write failure, if the capture stopped early.</summary>
     public string? WriteError => _writeError;
 
+    /// <summary>
+    /// Fired once, on the parser thread, the first time a write crosses the size cap.
+    ///
+    /// The session responds by stopping itself: only the runtime can close the stream with
+    /// the sequence that makes the file readable, and only a stopped session produces one.
+    /// </summary>
+    public event Action? CapReached;
+
     private void Capture(ReadOnlySpan<byte> data)
     {
         if (data.Length == 0 || _writeError is not null)
             return;
 
-        var remaining = _maxBytes - _written;
-        if (remaining <= 0)
-        {
-            _truncated = true;
-            return;
-        }
-
-        var take = (int)Math.Min(data.Length, remaining);
         try
         {
-            _file.Write(data[..take]);
-            Interlocked.Add(ref _written, take);
+            _file.Write(data);
+            Interlocked.Add(ref _written, data.Length);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ObjectDisposedException)
         {
             _writeError = ex.Message;
+            return;
         }
 
-        if (take < data.Length)
+        if (_capReached == 0 && _written > _maxBytes && Interlocked.Exchange(ref _capReached, 1) == 0)
+        {
             _truncated = true;
+            CapReached?.Invoke();
+        }
     }
 
     public override int Read(byte[] buffer, int offset, int count)

@@ -530,6 +530,7 @@ fn a_live_session_can_be_recorded_and_replayed_offline() {
             max_types: Some(60),
             verbose: false,
             deep_capture: false,
+            capture_max_mb: None,
             record: true,
             record_path: Some(path.display().to_string()),
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),

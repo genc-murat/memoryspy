@@ -278,6 +278,7 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
             max_types: Some(60),
             verbose: false,
             deep_capture: false,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: None,
@@ -464,6 +465,7 @@ fn attaching_to_a_nonexistent_process_fails_with_a_useful_message() {
             max_types: Some(50),
             verbose: false,
             deep_capture: false,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: None,
@@ -509,6 +511,7 @@ fn unknown_probe_ids_are_rejected() {
             max_types: Some(50),
             verbose: false,
             deep_capture: false,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: None,
@@ -584,6 +587,7 @@ fn a_deep_capture_resolves_allocation_call_sites() {
             max_types: Some(60),
             verbose: false,
             deep_capture: true,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
@@ -839,6 +843,7 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
             max_types: Some(60),
             verbose: false,
             deep_capture: true,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
@@ -930,6 +935,106 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
     let _ = std::fs::remove_dir_all(&app_dir);
 }
 
+/// A capture that reaches its size limit must still end up as a trace a parser can open.
+///
+/// The first version of the cap cut the file at the byte — measured, that is not a smaller
+/// trace but an unreadable one: TraceEvent refuses a nettrace whose tail is missing, and the
+/// user loses every call site to the last byte. The cap now ends the session instead, so the
+/// runtime flushes its buffers and writes its own stream epilogue, and the analysis reads a
+/// valid trace covering the prefix.
+#[test]
+fn a_size_capped_capture_still_resolves_call_sites() {
+    let Some(guard) = spawn_sample() else {
+        panic!("sample not built. Run `npm run sample:build` first");
+    };
+
+    thread::sleep(Duration::from_millis(1500));
+
+    let location = collector::locate_collector();
+    assert_located(&location);
+
+    let pid = guard.0.id() as i32;
+    let sink = Arc::new(RecordingSink::default());
+    let capture_dir = std::env::temp_dir().join(format!("memoryspy-cap-capture-{pid}"));
+    let _ = std::fs::remove_dir_all(&capture_dir);
+
+    let handle = collector::start_session(
+        sink.clone(),
+        &location,
+        SessionRequest {
+            pid,
+            probes: vec!["allocations".to_string(), "allocation-sites".to_string()],
+            interval_ms: Some(500),
+            max_types: Some(60),
+            verbose: false,
+            deep_capture: true,
+            // 1 MB is the smallest limit the collector accepts, and the runtime throttles the
+            // sampler to roughly 13 KB/s of capture against this sample — so the cap lands
+            // around the 80th second and the deadline below has to cover that with margin.
+            capture_max_mb: Some(1),
+            record: false,
+            record_path: None,
+            target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
+            target_runtime: None,
+        },
+        Some(capture_dir.clone()),
+    )
+    .expect("session must start");
+
+    assert!(
+        sink.wait_for("session.started", 1, Duration::from_secs(10)),
+        "no session.started message arrived"
+    );
+
+    // Nothing stops this session from the outside: reaching the cap has to be the
+    // collector's own decision, and it has to end the session on its own.
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while Instant::now() < deadline {
+        if matches!(handle.state(), SessionState::Stopped | SessionState::Failed) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        matches!(handle.state(), SessionState::Stopped),
+        "hitting the size cap did not end the session cleanly (state {:?})",
+        handle.state()
+    );
+
+    assert!(
+        sink.wait_for("allocation.site", 1, Duration::from_secs(90)),
+        "no call-site analysis arrived after the cap-driven stop; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
+    // The whole point of stopping cleanly: the truncated capture is still a trace, and the
+    // sampler's events made it into the readable prefix.
+    let analysis = sink.of_type("allocation.site");
+    let data = &analysis[0]["data"];
+    assert!(
+        data["sampledEvents"].as_u64().unwrap_or(0) > 0,
+        "the capped capture parsed but held no sampled allocations: {data}"
+    );
+
+    // The cap warns on the collector's stdout log channel (RecordingSink.logs only carries
+    // stderr), so the explanation is checked where the user actually reads it.
+    let cap_warned = sink
+        .of_type("log")
+        .iter()
+        .any(|message| {
+            message["data"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains("size limit"))
+        });
+    assert!(
+        cap_warned,
+        "the size-limit warning was not reported; logs: {:?}",
+        sink.of_type("log")
+    );
+
+    let _ = std::fs::remove_dir_all(&capture_dir);
+}
+
 /// The heap snapshot, which is the one probe whose answer is a graph rather than a number.
 ///
 /// The property under test is not "some bytes came back". It is the claim the panel makes to the
@@ -963,6 +1068,7 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
             max_types: Some(60),
             verbose: false,
             deep_capture: false,
+            capture_max_mb: None,
             record: false,
             record_path: None,
             target_name: None,

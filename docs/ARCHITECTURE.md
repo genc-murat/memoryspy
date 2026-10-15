@@ -214,10 +214,16 @@ Design decisions and their reasons:
   The ETLX is several times larger and exists only to give the analysis its method maps, so
   it is deleted before the result is announced — by the time a caller can see the analysis,
   the disk holds only the capture.
-- **Writes are capped, and truncation is reported.** An unattended session must not be able
-  to fill a disk, so `CaptureStream` stops at 256 MB by default. Reaching the cap is not
-  silent: the session logs it and the analysis says the capture is truncated rather than
-  presenting the prefix as complete.
+- **Writes are capped by ending the session, not by cutting the file.** An unattended session
+  must not be able to fill a disk, so the capture has a size limit (256 MB by default,
+  `--capture-max-mb`). The first version enforced it by stopping the copy at the byte — and
+  that produces a file no parser can open: a nettrace's closing sequence depends on the
+  writer's object state, so a trace cut mid-stream is not a smaller trace, it is no trace
+  (measured: every candidate suffix, including closing bytes copied from a healthy file, was
+  refused). Reaching the cap therefore ends *collection*: the session stops itself, the
+  runtime flushes its buffers and writes its own stream epilogue, and the analysis reads a
+  valid trace that covers the prefix. The size on disk can exceed the limit by the flush
+  (bounded by the runtime's in-memory buffers), and the session and the analysis both say so.
 - **A failing analysis cannot fail the session.** It runs inside the session's error budget —
   reported, suppressed after three attempts, never fatal — because the live data was already
   delivered by then.

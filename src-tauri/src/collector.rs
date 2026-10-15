@@ -644,6 +644,7 @@ impl SessionHandle {
             // A mid-session recording keeps the live stream; call sites need a capture that was
             // armed before the stream started, so it cannot be bolted onto a running session.
             deep_capture: false,
+            capture_max_mb: None,
             record: true,
             record_path: path,
             target_name,
@@ -778,6 +779,11 @@ pub struct SessionRequest {
     /// the answer arrives after detaching rather than while the session runs.
     #[serde(default)]
     pub deep_capture: bool,
+    /// Size limit for the deep capture, in megabytes. Omitted means the collector's default
+    /// (256 MB). Reaching the limit ends the session early — the alternative, cutting the
+    /// file mid-stream, produces a trace no parser can open.
+    #[serde(default)]
+    pub capture_max_mb: Option<u32>,
     /// Write this session's event stream to disk as it arrives.
     #[serde(default)]
     pub record: bool,
@@ -856,6 +862,10 @@ pub fn start_session(
         command.arg("--capture").arg(path);
     }
 
+    if let Some(max_mb) = request.capture_max_mb {
+        command.arg("--capture-max-mb").arg(max_mb.to_string());
+    }
+
     without_console_window(&mut command);
 
     let mut child = command
@@ -928,6 +938,7 @@ fn open_recording(
         "maxTypes": request.max_types,
         "verbose": request.verbose,
         "deepCapture": request.deep_capture,
+        "captureMaxMb": request.capture_max_mb,
     });
 
     match request.record_path.as_deref() {

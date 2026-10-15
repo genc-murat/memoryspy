@@ -30,3 +30,4 @@ src-tauri/resources/collector/*
 *.njsproj
 *.sln
 *.sw?
+.mimosa/

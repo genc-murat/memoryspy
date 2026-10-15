@@ -220,6 +220,20 @@ public sealed class CollectorSession : IDisposable
     /// <summary>Signals the parsing thread to unwind once the stream ends.</summary>
     public void RequestStop()
     {
+        if (_capture is not null)
+        {
+            // The stop of a deep capture has quiet phases the host deliberately waits through —
+            // draining the rundown the runtime still owes the session, closing the file,
+            // converting it — and a minute of silence after "Stop" reads as a hang unless it is
+            // said out loud. This is also the message that tells the user the analysis they are
+            // waiting for has not been forgotten, merely scheduled for after the stream ends.
+            _emitter.Log(
+                "info",
+                "Stop requested: draining the event stream and closing the capture. " +
+                "Allocation call sites are resolved from the finished file, which for a large " +
+                "capture takes tens of seconds — the session is working, not stuck.");
+        }
+
         try
         {
             _streamEnded.Set();

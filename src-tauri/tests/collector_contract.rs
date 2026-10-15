@@ -650,6 +650,22 @@ fn a_deep_capture_resolves_allocation_call_sites() {
         sink.logs.lock().unwrap()
     );
 
+    // The stop of a deep capture must wait through the collector's post-stop work — drain the
+    // rundown, close the file, convert it, fold the samples — rather than killing it on the
+    // plain session's 1.5 s grace. The kill does not merely lose the analysis: it lands
+    // mid-drain or mid-flush, the capture loses its tail, and the file stops being a trace at
+    // all (a 56 MB capture taken that way failed conversion with "Read past end of stream").
+    // The warning names the kill, so its absence pins the grace.
+    assert!(
+        sink.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, message)| !message.contains("did not stop within the timeout")),
+        "the collector was killed on stop before the capture analysis could finish; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
     let analysis = sink.of_type("allocation.site");
     let data = &analysis[0]["data"];
 

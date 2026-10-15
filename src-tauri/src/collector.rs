@@ -110,6 +110,27 @@ const COLLECTOR_ASSEMBLY: &str = "MemorySpy.Collector.dll";
 /// How long to wait for a graceful stop before killing the child process.
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// How long a session armed with a deep capture gets to finish its post-stop work.
+///
+/// Stopping a deep capture is not "detach and exit". The collector has to drain the event
+/// stream the runtime still owes it (a capture-armed session requested a rundown, so on a big
+/// service this is every module and method it loaded), close the capture file, convert it to
+/// ETLX and fold the samples — and none of that can be skipped, because the call-site answer
+/// is the reason the capture was armed in the first place.
+///
+/// Killing early is not neutral, which is what sets this number apart from the plain grace:
+/// the kill lands mid-drain or mid-flush, the capture loses its tail, and the file is no
+/// longer a trace at all — the 56 MB capture that motivated this constant failed conversion
+/// with "Read past end of stream" and the user lost the entire analysis to a 1.5 s timeout.
+///
+/// Five minutes is measured headroom, not a guess: analysis took ~0.5 s for a 3 MB capture
+/// here, so the 256 MB cap on a slower disk lands in the low minutes; add the one symbol
+/// request that ignores its own timeout (measured 62 s against a silent server — the symbol
+/// budget only stops *subsequent* lookups) and the drain of a large service, and there is no
+/// realistic path through the stop in less. A collector that is genuinely wedged is still
+/// killed — just after this deadline rather than after 1.5 s.
+const DEEP_CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// Maximum number of messages buffered before flushing to the frontend.
 const MESSAGE_BATCH_SIZE: usize = 64;
 
@@ -430,6 +451,10 @@ struct SessionInner {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Mutex<Option<ChildStdin>>,
     stop_requested: AtomicBool,
+    /// What `stop()` waits before killing: the plain grace, or the much longer one for a
+    /// session whose collector still has capture analysis ahead of it. See
+    /// [`DEEP_CAPTURE_STOP_TIMEOUT`] for why the two differ by two orders of magnitude.
+    graceful_stop_timeout: Duration,
     stats: SessionStats,
     started_at_unix_ms: u64,
     message_counts: Mutex<HashMap<String, u64>>,
@@ -581,9 +606,11 @@ impl SessionHandle {
 
     /// Asks the collector to stop cleanly, then force kills it if it does not comply.
     ///
-    /// The graceful path matters: it lets the collector detach its EventPipe session, which
-    /// leaves the target process in a clean state. The kill is the safety net for a target
-    /// that is wedged inside the runtime's tracing code.
+    /// The graceful path matters twice over: it lets the collector detach its EventPipe
+    /// session, which leaves the target process in a clean state, and it is the only window
+    /// in which a deep capture's analysis can run — the answer the session was armed for.
+    /// The kill remains the safety net for a collector that is wedged inside the runtime's
+    /// tracing code, on the deadline the session was started with.
     pub fn stop(&self) {
         self.0.stop_requested.store(true, Ordering::SeqCst);
         self.0.set_state(SessionState::Stopping, Some("Stop requested.".into()));
@@ -593,9 +620,9 @@ impl SessionHandle {
         let child_slot = self.0.child.clone();
         let id = self.0.id.clone();
         let sink = self.0.sink.clone();
+        let deadline = Instant::now() + self.0.graceful_stop_timeout;
 
         thread::spawn(move || {
-            let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
             loop {
                 if Instant::now() > deadline {
                     break;
@@ -762,6 +789,13 @@ pub fn start_session(
         child: Arc::new(Mutex::new(Some(child))),
         stdin: Mutex::new(stdin),
         stop_requested: AtomicBool::new(false),
+        // A capture-armed collector has minutes of post-stop work (drain, close, convert,
+        // analyse), so it earns the long grace; a plain one only has to detach and exit.
+        graceful_stop_timeout: if capture_path.is_some() {
+            DEEP_CAPTURE_STOP_TIMEOUT
+        } else {
+            GRACEFUL_STOP_TIMEOUT
+        },
         stats: SessionStats::default(),
         started_at_unix_ms: now_unix_ms(),
         message_counts: Mutex::new(HashMap::new()),

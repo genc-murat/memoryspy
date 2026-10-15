@@ -216,6 +216,17 @@ Design decisions and their reasons:
 - **A failing analysis cannot fail the session.** It runs inside the session's error budget —
   reported, suppressed after three attempts, never fatal — because the live data was already
   delivered by then.
+- **The stop waits for the analysis, and the grace is not one number.** Stopping a deep
+  capture has minutes of quiet work in it — draining the rundown the runtime owes the session,
+  closing the file, converting it — so the host waits 5 minutes before killing instead of the
+  1.5 s a plain session gets. The asymmetry is not generosity: a kill that lands mid-drain or
+  mid-flush cuts the capture's tail off, and the file stops being a trace at all — the 56 MB
+  capture that established this failed conversion with "Read past end of stream", and the user
+  lost the entire analysis they had armed the capture for. The deadline is the safety net for a
+  collector wedged inside the runtime, which a capture-armed session can afford only because
+  the collector says it is working (`Stop requested: draining the event stream…` → `Capture
+  complete` → `Resolving allocation call sites…`) so a long stop reads as progress, not as a
+  hang.
 
 **From method names to a line of code.** A name still is not a place: `PayloadWriter.Serialize`
 may allocate in half a dozen statements. The runtime's stack carries an IL offset, and the only

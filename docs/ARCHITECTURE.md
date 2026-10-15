@@ -44,6 +44,18 @@ as long as it wants a provider some other probe already enables — for the thre
 probes this means exactly two providers (`System.Runtime` and
 `Microsoft-Windows-DotNETRuntime`).
 
+Merging is not always neutral, though, and this is worth knowing before trusting a probe to
+keep seeing what it saw alone. `allocation-sites` has to ask for `AllocationSampling`
+(`0x80000000000`), because the older sampled-allocation keyword is dead on .NET 10; with that
+keyword in the merged set the runtime reports allocations as per-allocation
+`AllocationSampling` events (id 303) and stops raising the `GC/AllocationTick` (id 10) events
+the live `allocations` probe matched on. Measured on .NET 10.0.9 against the leaking sample:
+758 ticks and 0 samples without a capture, 0 ticks and 776 samples with one — so the live
+per-type panel, which only knew the tick name, went empty exactly when a capture was armed.
+The probe now reads both kinds and reports `samplingBasis`, which is the general lesson: a
+probe that keys off an event *name* is coupled to the session's keyword set, not just to its
+own.
+
 ## The protocol
 
 Newline-delimited JSON on the collector's stdout; commands as NDJSON on its stdin. Every
@@ -60,7 +72,7 @@ Message types emitted today:
 | `hello` | – | capabilities: probe list, event types, normalisation rules, target metadata |
 | `session.started` / `session.stopped` | – | pid, enabled probes, merged providers |
 | `counter.sample` | runtime-counters | batched counter readings, normalised |
-| `allocation.sample` | allocations | per-type allocation totals and rates for the interval |
+| `allocation.sample` | allocations | per-type allocation totals and rates for the interval, plus `samplingBasis` — which event kind produced them, since a capture-armed session gets per-allocation samples instead of 100 KB ticks |
 | `heap.stats` | gc-stats | per-generation heap breakdown after a collection |
 | `gc.event` | gc-stats | one collection: generation, reason, background flag, real pause ms |
 | `gc.summary` | gc-stats | cumulative collection counts and finalizer activity |
@@ -270,6 +282,79 @@ frames below it as the chain that shows how that method was reached. When every 
 runtime code the site is marked `userCode: false` and the UI labels it `runtime`, because
 "the runtime allocated 288 bytes here" is a different statement from "your code did".
 
+## Heap snapshot: asking the runtime who holds the objects
+
+The `Heap Snapshot` view answers what no counter can: *what survives collection, and which
+reference is keeping it alive?* It does that by asking the runtime to walk its own object graph,
+which makes it the only probe that is a discrete event rather than a periodic sample — and the
+only one that deliberately does **not** join the shared EventPipe session.
+
+```
+{"cmd":"snapshot"} ──► HeapSnapshotProbe.TryBeginSnapshot
+                              │
+                              └─► its own EventPipe session, keyword GCHeapSnapshot (0x1980001)
+                                        │
+   Microsoft-Windows-DotNETRuntime ─────┴─► TypeBulkType (names) ─┐
+                                              GCBulkNode (objects) ─┼─► graph built in-process
+                                              GCBulkEdge (refs)    ─┤   ├─ live bytes per type
+                                              GCBulkRootEdge/…   ──┘   └─ BFS from the roots
+                                        │
+   GCStart(Depth=2) / GCStop ───────────┴─► "the walk is done" ──► drain ──► heap.snapshot
+```
+
+Design decisions and their reasons:
+
+- **Its own session, not the shared one.** Adding the heap-snapshot keyword to the shared
+  session would make every session — including one that never asks for a snapshot — force a
+  heap walk on its next collection. The probe therefore declares `Channel = None` and no
+  providers, and opens a session of its own when it is asked. The consequence for the session
+  layer: a probe selection that contributes no providers is no longer an error, because a
+  provider-free session is still how the command channel and the target's lifetime are observed.
+  The runtime provider is enrolled at `Critical` level so the session exists and emits nothing.
+- **Starting is the trigger.** Enabling the keyword is what makes the runtime walk the heap at
+  its next collection; no IPC command is sent. Completion has no event of its own — it is the
+  `GCStop` matching the `GCStart` with `Depth == 2` and a non-background type — and a short drain
+  after it is what keeps the tail of the bulk events from being cut off (measured: 4 338 of
+  4 378 556 references, 0.1%, without it).
+- **The graph is built here because the library does not build it.** TraceEvent 4.0.0 ships the
+  typed bulk events and no graph: no `MemoryGraph`, no retained-size call, no `.gcdump` reader
+  (established by reflecting over the referenced assembly, not from release notes). Nodes, edges,
+  roots, the breadth-first search and the retained-size analysis live in the probe, which also
+  means the payload can be honest about what it saw: an `inventory` of the event kinds that
+  arrived, and the counts of anything it could not name (`unknownTypeObjects`).
+- **"What would be freed" is asked of the graph, not derived from it.** A dominator tree would
+  answer it for every object in a couple of passes, and that was the first implementation. It was
+  replaced because this graph defeats the iterative dominance algorithm: the ancestor walks it
+  needs are long enough that a 6–7 M object heap hit the pass's safety budget — 80 s of CPU with
+  nothing to show for it. Walking the graph again with the objects removed gives the same number
+  for the objects the payload actually reports, is exact by construction rather than exact if the
+  algorithm is right, and costs **34 ms per walk** over 7.6 M objects. That is the trade: about
+  forty extra walks in a snapshot (≈1.5 s) for a number nobody has to doubt. `HeapGraphAnalysis`
+  holds the mechanism, and a budget bounds how many questions are asked.
+- **A partial walk is reported as partial, not as a small heap.** The bulk events are dropped by
+  the runtime when the reader falls behind, and `EventPipeBufferingMode.Block` — what
+  `dotnet-gcdump` uses — is unreachable here because it needs a newer IPC command that the
+  diagnostics server rejects. So the buffer is raised and the result is checked against two facts
+  that did **not** come from the walk: how many objects a root can reach, and the runtime's own
+  `TotalHeapSize` for the same collection. When either says the walk is short, the payload carries
+  a `coverageNote`, the type totals become a stated floor, and retention paths are withheld
+  entirely — see `docs/EXTENDING.md` for the measured 35 GB case that made this necessary.
+- **Two numbers that are easy to confuse are both reported and distinguished.** Live bytes is what
+  a type's objects occupy; the "freed if removed" figure is what stops being reachable when those
+  objects go away, which is usually larger because a small type can hold a large one. On the
+  sample, `SessionRecord` occupies 119.5 MB and accounts for **825.6 MB**, and the 92.6 MB entry
+  array accounts for 918.2 MB — a self-consistent pair, since removing the records frees the
+  records, their payload arrays and their name strings, and removing the array frees all of that
+  plus the array itself. The payload carries a `note` spelling out the difference, and a
+  `retainedNote` whenever the budget did not reach every type.
+- **The answer has a shape the UI reproduces.** Every retention path is root-first, because the
+  top of the chain is the reference that has to be cut, and each frame keeps the runtime's own
+  label (a root kind, a static field name, `field #n`) rather than a formatted guess.
+
+The deliverable is verified end to end against the leaking sample: the contract test enables only
+this probe, takes a snapshot, and asserts the chain from a root to `SessionRecord` — through the
+`Dictionary` and its `Entry[]` array — which is the same answer the panel shows a user.
+
 ## Threading model
 
 Collector:
@@ -381,6 +466,15 @@ Three layers, in increasing order of what they actually prove:
 
 Layer 3 is the one that would have caught (and did catch) the class of bug that matters here:
 wrong units, wrong scaling, silent empty payloads.
+
+It had one blind spot, and a real defect lived in it for exactly that reason: the per-type
+allocation assertions run in a session *without* a capture, while the call-site assertions run
+in one *with* a capture, so nothing ever checked both probes in the same session. Arming the
+capture changes the runtime's turn of event (`GC/AllocationTick` gives way to
+`AllocationSampling`), and the live probe — which matched on the tick's name — delivered an
+empty payload in that configuration while the capture file next to it held thousands of
+samples. The deep-capture test now asserts on the live allocation samples of the *capturing*
+session as well, which is the assertion that would have failed.
 
 The UI has a dev-only mock backend (`src/lib/mock.ts`, enabled with `?mock=1`) that emits the
 same envelopes from a simulated leaking service. It exists so the interface can be built and

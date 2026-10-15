@@ -4,6 +4,7 @@ import { rankSuspects } from '../lib/analysis';
 import { formatBytes, formatBytesPerSecond, formatPercent } from '../lib/format';
 import { palette } from '../lib/palette';
 import type { MetricsStore, TypeRecord } from '../lib/store';
+import type { AllocationSamplingBasis } from '../lib/types';
 import { Sparkline } from './Sparkline';
 
 interface Props {
@@ -17,8 +18,30 @@ const SORTS: { key: SortKey; label: string; hint: string }[] = [
   { key: 'acceleration', label: 'Acceleration', hint: 'How much the rate rose compared with the previous interval — the best signal for “what is getting worse”.' },
   { key: 'total', label: 'Total allocated', hint: 'Everything allocated since attaching. Useful for volume, misleading for leaks.' },
   { key: 'size', label: 'Object size', hint: 'Average sampled object size. Objects of 85 KB or more land on the Large Object Heap.' },
-  { key: 'samples', label: 'Samples', hint: 'Number of allocation ticks seen. A very low count means the numbers are noisy.' },
+  { key: 'samples', label: 'Samples', hint: 'Number of sampled allocations seen. A very low count means the numbers are noisy.' },
 ];
+
+/**
+ * What the numbers on this panel mean is decided by the session's keywords, not by the panel:
+ * a plain session reports one tick per ~100 KB allocated, while a session with a deep capture
+ * armed gets one event per sampled allocation carrying the object's own size. Naming the basis
+ * in force is what keeps those two from being read as the same measurement — they rank types
+ * alike, but their volumes differ by the sampling ratio.
+ */
+function samplingNote(basis: AllocationSamplingBasis | null): string {
+  if (basis === 'allocationSampling') {
+    return (
+      'Deep capture is armed, so the runtime reports one event per sampled allocation — the allocated object’s own ' +
+      'size — instead of a tick per 100 KB. Shares between types are unbiased, but the volumes are far smaller ' +
+      'than in a session without a capture, so read this list against itself rather than against those numbers.'
+    );
+  }
+
+  return (
+    'The runtime samples roughly one allocation tick per 100 KB allocated, so these are scaled estimates. Types ' +
+    'that allocate rarely may not appear at all.'
+  );
+}
 
 /**
  * Answers "which class is growing?".
@@ -49,9 +72,13 @@ export function TypesPanel({ store }: Props) {
       }
     };
     return all.sort(comparator);
-  }, [store, sort]);
+    // `store` is a stable reference, so it alone would freeze this list at whatever it held on
+    // the first render — a session attached to while this tab was open showed no types at all
+    // until some other control recomputed it. `store.version` is what changes, so it is what
+    // the list has to depend on.
+  }, [store, store.version, sort]);
 
-  const suspects = useMemo(() => rankSuspects(store, 5), [store]);
+  const suspects = useMemo(() => rankSuspects(store, 5), [store, store.version]);
 
   const totalRate = records.reduce((sum, record) => sum + Math.max(0, record.currentRate), 0) || 1;
 
@@ -66,7 +93,7 @@ export function TypesPanel({ store }: Props) {
       <div className="panel">
         <div className="notice notice-info">
           No allocation samples yet. The allocations probe reports once per interval after the runtime raises its
-          first allocation tick — allocate something in the target process and this will fill in.
+          first sampled allocation — allocate something in the target process and this will fill in.
         </div>
       </div>
     );
@@ -81,8 +108,8 @@ export function TypesPanel({ store }: Props) {
             <span className="suspect-name">{top.record.typeName}</span>
             <span className="suspect-meta">
               {formatPercent(top.share * 100)} of sampled allocations · {formatBytesPerSecond(top.record.currentRate)}
-              {top.accelerating && <span className="chip chip-warn">rate rising</span>}
-              {top.record.averageObjectBytes >= 85 * 1024 && <span className="chip chip-warn">LOH-sized</span>}
+              {top.accelerating && <span className="chip chip-warning">rate rising</span>}
+              {top.record.averageObjectBytes >= 85 * 1024 && <span className="chip chip-warning">LOH-sized</span>}
             </span>
           </div>
           <p className="suspect-advice">
@@ -96,10 +123,7 @@ export function TypesPanel({ store }: Props) {
       <section className="block-head block-head-sticky">
         <div>
           <h2>Allocations by type</h2>
-          <p className="caveat">
-            The runtime samples roughly one allocation tick per 100 KB allocated, so these are scaled estimates. Types
-            that allocate rarely may not appear at all.
-          </p>
+          <p className="caveat">{samplingNote(store.allocationSamplingBasis)}</p>
         </div>
         <div className="table-controls">
           <input

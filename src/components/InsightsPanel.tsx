@@ -66,7 +66,9 @@ function FindingCard({ finding, onOpenTarget }: { finding: Finding; onOpenTarget
  * quality, the numbers behind it and the counter it came from can be argued with.
  */
 export function InsightsPanel({ store, onOpenTarget }: Props) {
-  const diagnosis = useMemo(() => diagnose(store), [store]);
+  // `store` is stable, so the findings would otherwise be computed once and never revisited as
+  // the session grows; `store.version` is the value that actually changes.
+  const diagnosis = useMemo(() => diagnose(store), [store, store.version]);
 
   const criticalCount = diagnosis.findings.filter((finding) => finding.severity === 'critical').length;
 

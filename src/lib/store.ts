@@ -1,10 +1,12 @@
 import type {
   AllocationSampleData,
+  AllocationSamplingBasis,
   AllocationSiteData,
   CollectorMessage,
   CounterReading,
   GcEventData,
   GcSummaryData,
+  HeapSnapshotData,
   HeapStatsData,
   ProbeDescriptor,
   SessionState,
@@ -26,6 +28,18 @@ export interface CounterSeries {
 
 /** A single collection, kept for the GC timeline. */
 export interface GcEventRecord extends GcEventData {
+  seq: number;
+  receivedAt: number;
+}
+
+/**
+ * One completed heap walk.
+ *
+ * A snapshot answers a question about an instant, not a trend, so these are kept as a short
+ * list of reports rather than a time series. Walking the heap stops the target, so a session
+ * will hold a handful at most.
+ */
+export interface HeapSnapshotRecord extends HeapSnapshotData {
   seq: number;
   receivedAt: number;
 }
@@ -102,6 +116,17 @@ export class MetricsStore {
    * of reports rather than a timeline: the panel shows the newest and can show the rest.
    */
   readonly allocationSites: AllocationSiteData[] = [];
+
+  /** Completed heap walks, newest first. See {@link HeapSnapshotRecord}. */
+  readonly snapshots: HeapSnapshotRecord[] = [];
+
+  /**
+   * Which event kind is feeding `types` — a 100 KB tick or a per-allocation sample.
+   *
+   * Kept on the store rather than derived per panel because it is a property of the session's
+   * keywords: arming a deep capture switches it, and the numbers change scale with it.
+   */
+  allocationSamplingBasis: AllocationSamplingBasis | null = null;
 
   /** Where the running session's raw capture is being written, if it is capturing at all. */
   capturePath: string | null = null;
@@ -255,6 +280,29 @@ export class MetricsStore {
         }
         break;
       }
+      case 'heap.snapshot': {
+        const snapshot = unwrap<HeapSnapshotData>(message);
+        if (snapshot) {
+          this.snapshots.unshift({ ...snapshot, seq: ++this.seq, receivedAt: message.ts });
+          // Each walk is a pause in the target, so keeping a long history of them would be
+          // keeping bulk data nothing reads. The newest is the one that replaces the picture.
+          if (this.snapshots.length > 8) this.snapshots.pop();
+        }
+        break;
+      }
+      case 'command.result': {
+        // The snapshot is the one command whose answer is not this message but a later
+        // `heap.snapshot`, so its result carries the collector's own wording for why a walk
+        // did not start — which is the only useful thing to show the user at this point.
+        const result = unwrap<{ cmd?: string; ok?: boolean; detail?: string; error?: string }>(message);
+        if (result?.cmd === 'snapshot') {
+          this.pushLog(message.ts, 'collector', {
+            level: result.ok === false ? 'error' : 'info',
+            message: result.ok === false ? (result.error ?? 'The snapshot was not started.') : (result.detail ?? 'Heap snapshot started.'),
+          });
+        }
+        break;
+      }
       case 'allocation.site': {
         const analysis = unwrap<AllocationSiteData>(message);
         if (analysis) {
@@ -301,6 +349,8 @@ export class MetricsStore {
 
   private applyAllocationSample(data: AllocationSampleData | null, at: number) {
     if (!data?.types) return;
+
+    if (data.samplingBasis) this.allocationSamplingBasis = data.samplingBasis;
 
     for (const snapshot of data.types) {
       const existing = this.types.get(snapshot.typeName);
@@ -388,12 +438,14 @@ export class MetricsStore {
   clearData() {
     this.counters.clear();
     this.types.clear();
+    this.allocationSamplingBasis = null;
     this.heap.clear();
     this.heapHistory.length = 0;
     this.gcEvents.length = 0;
     this.gcSummary.length = 0;
     this.logs.length = 0;
     this.allocationSites.length = 0;
+    this.snapshots.length = 0;
     this.capturePath = null;
     this.captureBytes = 0;
     this.captureTruncated = false;
@@ -426,6 +478,11 @@ export class MetricsStore {
 
   latestHeap(): HeapSnapshotPoint | undefined {
     return this.heapHistory[this.heapHistory.length - 1];
+  }
+
+  /** The most recent completed heap walk, if one has finished. */
+  latestSnapshot(): HeapSnapshotRecord | undefined {
+    return this.snapshots[0];
   }
 
   /** Types ranked by current allocation rate, capped for rendering. */

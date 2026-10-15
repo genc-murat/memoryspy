@@ -5,14 +5,21 @@ masaüstü uygulaması. Tauri (Rust + React) ile yazıldı; veriyi EventPipe üz
 tarafındaki bir yardımcı süreç toplar.
 
 `dotnet-counters monitor -n <proc> --counters System.Runtime[working-set,gc-heap-size,...]`
-komutunun verdiği sayıları gösterir, ama üç şeyi ekler:
+komutunun verdiği sayıları gösterir, ama dört şeyi ekler:
 
-1. **Hangi sınıf büyüyor?** — `GC/AllocationTick` olaylarından tür bazında ayırma (allocation)
-   hızı çıkarılır, liste hâlinde ve zaman içinde artışıyla gösterilir.
+1. **Hangi sınıf büyüyor?** — runtime'ın örneklediği ayırma olaylarından (`GC/AllocationTick`, ya
+   da yakalama açıkken `AllocationSampling`) tür bazında ayırma hızı çıkarılır, liste hâlinde ve
+   zaman içinde artışıyla gösterilir.
 2. **Sayılar ne anlama geliyor?** — trend analizi (lineer regresyon + r²), eşikler ve
    "şimdi ne yapmalı" adımları ile birlikte bulgular hâlinde sunulur.
 3. **Nereye bakmalı?** — Gen 2'de birikme, LOH büyümesi, GC handle sızıntısı, thread pool
    açlığı gibi durumlar ayrı ayrı tanınır ve birbirinden ayrılır.
+4. **Neyin hayatta kaldığı ve onu kimin tuttuğu?** — istendiğinde runtime'ın gerçek nesne
+   grafiği yürünür (heap snapshot): tür başına canlı nesne sayısı ve bayt, her tür için
+   **"silinirse boşalan"** bayt miktarı (türün tuttuğu alan, kapladığı alan değil), ve en
+   büyük türler için **bir GC kökünden canlı bir örneğe giden referans zinciri** — her halkası
+   kendi tuttuğu alanla birlikte. Böylece "bu tür büyük" ile "bu tür *şundan dolayı* büyük"
+   birbirinden ayrılır; zincirin tepesindeki referans kesilmesi gereken referanstır.
 
 Kısa yol: uygulamayı aç, soldan süreci seç, "attached" ol. Sağdaki **Managed heap** şeridi
 her zaman açık kalır; üstteki büyük sayı ise asıl sorunun cevabıdır: **dakikada kaç MB
@@ -45,6 +52,25 @@ npm run sample:run -- all          # hepsi birden
 Sonra uygulamada `MemorySpy.Samples.LeakyCache` sürecine bağlan. `cache` modunda
 `SessionRecord` tipi birkaç saniye içinde "Top suspect" olarak görünmelidir.
 
+Aynı sızıntının **tutulma zinciri** için `Heap Snapshot` sekmesinden bir yürüyüş başlat
+(düğme; hedef bir Gen 2 collection boyunca duraklar). Örnekte çıkan cevap şudur — zincirin
+en üstündeki referans kesilmesi gereken referanstır:
+
+```
+static System.Threading.TimerQueue[].<Instance>          (runCache async durum makinesi)
+  → System.Threading.TimerQueue → TimerQueueTimer → DelayPromiseWithCancellation
+  → ContinueWithTaskContinuation → ContinuationTaskFromTask
+  → AsyncStateMachineBox`1[VoidTaskResult] → <<Main>$>g__RunCache|0_7>d
+  → Dictionary`2[System.Guid, SessionRecord]       80 B
+  → Entry[System.Guid, SessionRecord][]            92 MB   (4,3 M kaydı tek nesnede tutan dizi)
+  → SessionRecord                                  56 B
+  → System.Byte[]                                 280 B
+```
+
+Zincir, sızan sözlüğü tutan şeyin *async devam (continuation) durum makinesi* olduğunu — ve
+onun da thread pool zamanlayıcı kuyruğundan köklendiğini — gösterir. Yani sorun sözlüğün
+kendisi değil, onu yaşatan `Task.Delay(...).ContinueWith(...)` örüntüsüdür.
+
 ### Derleme
 
 ```bash
@@ -76,6 +102,7 @@ yapıştırılabilir.
 | **Types** | Tür bazında ayırma hızı, payı, trend sparkline'ı, ortalama nesne boyutu, toplam; en olası şüpheli |
 | **Call Sites** | Belleği **hangi metot** ayırıyor: çağrı yeri bazında pay, örneklenen hacim, hâkim tip, açılan çağrı zinciri; aynı verinin tip tarafından görünümü |
 | **GC & Heap** | Nesil bazında heap kompozisyonu, tek tek collection kayıtları (gerçek duraklama süreleri), collection sebepleri |
+| **Heap Snapshot** | İstek üzerine canlı heap yürüyüşü: tür başına canlı nesne/bayt ve "silinirse boşalan" bayt, GC köklerinden canlı örneklere giden referans zincirleri ("bunu kim tutuyor?", halka başına tutulan alan), hedefin duraklama maliyeti |
 | **Diagnosis** | Bulgular: önem derecesi, kanıt sayıları ve yapılacaklar listesi |
 | **Diagnostics** | Collector stderr'i, oturum istatistikleri, sayıları sıfırlama |
 | **Recordings** | Diskteki kayıtlar ve bunları çevrimdışı replay etme; başka makineden gelen dosyayı açma |
@@ -100,7 +127,7 @@ görünür.
 | | Ne olur |
 | --- | --- |
 | Bağlanırken | Ham EventPipe akışı kayıt klasörüne `capture-<pid>-<zaman>.nettrace` olarak kopyalanır |
-| Çalışırken | Diğer sekmeler normal çalışır; `Call Sites` "henüz yok" der ve yakalamanın nereye yazıldığını gösterir |
+| Çalışırken | Diğer sekmeler normal çalışır; `Call Sites` "henüz yok" der ve yakalamanın nereye yazıldığını gösterir. `Types` çalışmaya devam eder ama sayıları **örnekleme temeline** geçer: runtime bu oturumda tik yerine nesne başına örnek yayar, panel bunu kendi cümlesiyle söyler |
 | Detach edince | Capture ETLX'e çevrilir, metot adları çözülür, PDB'ler okunup **dosya:satır** bulunur, çağrı yerleri sıralanır; ara ETLX dosyası silinir, `.nettrace` kalır |
 | Replay'de | Çağrı yerleri kaydın içindedir, yani dosyayı başka bir makinede açtığında da görünür |
 
@@ -252,17 +279,39 @@ kabuğu değişmez.
 
 Dürüst olmak gerekirse, bu sürümün yapamadıkları ve bilinçli tasarım kararları:
 
-- **Ayırma verisi örneklenmiştir.** Runtime kabaca her 100 KB ayırmada bir olay üretir.
-  Yani "System.Byte[] 11 MB/s ayırdı" bir tahmindir, tam muhasebe değildir. Nadir ayıran
-  türler listede hiç görünmeyebilir.
+- **Ayırma verisi örneklenmiştir, ve iki farklı temelde gelebilir.** Yakalama kapalıyken
+  runtime kabaca her 100 KB ayırmada bir `GC/AllocationTick` üretir; yani "System.Byte[]
+  11 MB/s ayırdı" bir tahmindir, tam muhasebe değildir ve nadir ayıran türler listede hiç
+  görünmeyebilir. Derin yakalama açıkken ise oturumun anahtar kelimeleri değiştiği için
+  runtime bunun yerine **her örneklenen ayırma için** nesnenin kendi boyutunu taşıyan bir
+  `AllocationSampling` olayı yayar (ölçüldü: aynı süreçte tik temelinde 758 tik, yakalama
+  temelinde 776 örnek). Panel hangi temelde olduğunu kendisi yazar, çünkü paylar iki temelde
+  de yansızdır ama hacimler aynı ölçekte değildir — yakalama açıkken görülen mutlak sayılar
+  (örneğin 0,04 MB/s) aynı uygulamanın tik tabanlı sayısıyla (17,9 MB/s) karşılaştırılmaz,
+  listenin kendi içindeki sıralama karşılaştırılır.
 - **Ayırma ≠ tutulma.** `Types` sekmesi neyin *üretildiğini* söyler; sızıntı için neyin
   *hayatta kaldığı* önemlidir. Bu yüzden panelin yanında heap trendi durur ve "şüpheli"
   uyarısı ancak heap de büyürken yükselir.
-- **"Hangi kod ayırıyor" cevaplandı, "kim tutuyor" henüz değil.** `Call Sites` sekmesi
-  ayırma anındaki çağrı yığınını verir; sızıntı ise neyin *hayatta kaldığıdır*. Tutulma
-  grafiği için `GCHeapDump` tabanlı bir heap snapshot probe'u hâlâ yol haritasında
-  (`docs/EXTENDING.md` içinde taslağı var). İkisi birlikte "hangi kodda üretiliyor" +
-  "hangi kod tutuyor" sorusunu kapatır.
+- **"Kim tutuyor" cevabı bir yürüyüşe mal olur.** `Heap Snapshot` sekmesi tutulma zincirini
+  runtime'ın kendi grafiğinden verir, ama bedeli gerçektir: yürüyüş bir Gen 2 collection
+  sırasında yapıldığı için hedef duraklar (panel `pauseMs` olarak yazar) ve collector grafiği
+  kendi belleğinde tutar. Bu yüzden periyodik bir örnek değil, basılan bir düğmedir.
+- **Heap yürüyüşü EventPipe üzerinden gelir, ve tampon dolduğunda olay atılabilir.**
+  `dotnet-gcdump`'ın kullandığı `EventPipeBufferingMode.Block` bu runtime'da erişilebilir
+  değil (`UnsupportedCommandException`), bu yüzden snapshot oturumunun tamponu yükseltilir ve
+  eksik kalma **ölçülür**: yürünen nesnelerin köklerden erişilebilme oranı ve sayılan baytın
+  runtime'ın aynı collection için bildirdiği `TotalHeapSize` ile karşılaştırılması. Ölçüldü:
+  35 GB'lık bir heap'te yürüyüş 1,7 GB ve 13 138 344 nesnenin 3 240'ını gördü — olayların
+  %95'i düşmüştü. Böyle bir durumda panel tür toplamlarını bir **alt sınır** olarak sunar ve
+  **tutulma zinciri hiç göstermez**: eksik referanslarla çizilen bir zincir tahmin olurdu.
+- **İki farklı bayt sayısı yan yana durur; karıştırılmamalıdır.** `liveBytes` türün
+  nesnelerinin kapladığı alandır; **"silinirse boşalan"** ise o türün bütün nesneleri
+  kaldırıldığında artık erişilemeyen canlı baytlardır — yani türün *tuttuuğu* alan, *kapladığı*
+  alan değil. Küçük bir tür büyük bir şeyi tutabildiği için bu sayı genelde daha büyüktür:
+  örnekte `SessionRecord` 119,5 MB yer kaplar ama **825,6 MB**'lık alanı ayakta tutar; 92,6 MB'lık
+  `Entry[]` dizisi ise **918,2 MB**'ı tutar. Ölçüm tahmin değildir: nesneler grafikten çıkarılıp
+  graf yeniden yürünür, ama soru başına bir yürüyüş harcandığı için sayı yalnızca raporlanan
+  türlere ve zincir halkalarına verilir, geri kalanı "—" kalır.
 - **Derin yakalama canlı değildir.** Çağrı yığınları ancak tamamlanmış bir akıştan
   çözülebildiği için cevap Detach anında gelir; oturum sürerken bu sekme boştur. Ayrıca
   diske yazar (varsayılan üst sınır 256 MB; sınıra gelinirse yakalama kesilir ve bu açıkça

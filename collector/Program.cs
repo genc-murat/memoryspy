@@ -264,6 +264,27 @@ static void ListenForCommands(CollectorSession session, IReadOnlyList<ICollector
                 emitter.Emit(MessageType.Hello, null, BuildCapabilities());
                 break;
 
+            case "snapshot":
+            {
+                // The heap snapshot is not a per-interval metric — it stops the target for a walk —
+                // so it is triggered explicitly and answers with one heap.snapshot message.
+                var heapProbe = probes.OfType<HeapSnapshotProbe>().FirstOrDefault();
+                if (heapProbe is null)
+                {
+                    emitter.Emit(MessageType.CommandResult, null, new
+                    {
+                        cmd = "snapshot",
+                        ok = false,
+                        error = "The heap-snapshot probe is not enabled in this session; add it with --probes.",
+                    });
+                    break;
+                }
+
+                var started = heapProbe.TryBeginSnapshot(out var detail);
+                emitter.Emit(MessageType.CommandResult, null, new { cmd = "snapshot", ok = started, detail });
+                break;
+            }
+
             default:
                 emitter.Emit(MessageType.CommandResult, null, new { cmd = command, ok = false, error = "unknown command" });
                 break;
@@ -344,6 +365,10 @@ static void PrintUsage()
 
         Stdin commands (one JSON object per line):
           {"cmd":"stop"}   {"cmd":"ping"}   {"cmd":"reset"}   {"cmd":"capabilities"}
+          {"cmd":"snapshot"}
+              Walks the live object graph of the target and reports what survives collection and
+              which GC root holds it. Requires the heap-snapshot probe; the target pauses for one
+              Gen 2 collection and the walk can take seconds on a large heap.
 
         Probes:
         """);

@@ -29,6 +29,8 @@ export interface PanelContext {
   onReplayRecording: (path: string) => void;
   onOpenTarget: (target?: string) => void;
   onResetCounters: () => void;
+  /** Asks the live collector to walk the heap; the result arrives as a `heap.snapshot` message. */
+  onTakeSnapshot: () => void;
   onSaveSettings: (settings: import('../lib/types').Settings) => Promise<void>;
   onRefreshCollector: () => Promise<void>;
 }
@@ -77,6 +79,14 @@ export const PANELS: PanelDefinition[] = [
     requires: ['gc-stats'],
     consumes: ['heap.stats', 'gc.event', 'gc.summary'],
     component: GcPanelLazy,
+  },
+  {
+    id: 'heap',
+    label: 'Heap Snapshot',
+    hint: 'What survives collection, and which root keeps it alive.',
+    requires: ['heap-snapshot'],
+    consumes: ['heap.snapshot'],
+    component: HeapSnapshotPanelLazy,
   },
   {
     id: 'insights',
@@ -179,6 +189,7 @@ import { OverviewPanel } from '../components/OverviewPanel';
 import { TypesPanel } from '../components/TypesPanel';
 import { CallSitesPanel } from '../components/CallSitesPanel';
 import { GcPanel } from '../components/GcPanel';
+import { HeapSnapshotPanel } from '../components/HeapSnapshotPanel';
 import { InsightsPanel } from '../components/InsightsPanel';
 import { LogPanel } from '../components/LogPanel';
 import { RecordingsPanel } from '../components/RecordingsPanel';
@@ -205,6 +216,15 @@ function CallSitesPanelLazy({ store }: PanelContext) {
 
 function GcPanelLazy({ store }: PanelContext) {
   return <GcPanel store={store} />;
+}
+
+function HeapSnapshotPanelLazy({ store, activeRecordingPath, onTakeSnapshot }: PanelContext) {
+  // A replay has no process to walk, and walking one mid-replay would produce a snapshot that
+  // belongs to no timeline, so the control is disabled rather than hidden: seeing why is better
+  // than finding it missing.
+  return (
+    <HeapSnapshotPanel store={store} onTakeSnapshot={onTakeSnapshot} disabled={activeRecordingPath !== null} />
+  );
 }
 
 function InsightsPanelLazy({ store, onOpenTarget }: PanelContext) {

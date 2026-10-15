@@ -346,6 +346,29 @@ export function App() {
     [attachedProcess, sessionId, store],
   );
 
+  /**
+   * Asks the collector to walk the live heap.
+   *
+   * Nothing comes back from this call: a walk stops the target for one collection and takes
+   * seconds to minutes, so the collector acknowledges the request and the snapshot itself arrives
+   * later as a `heap.snapshot` message. Both the acknowledgement and the walk's own log lines land
+   * in the diagnostics view, which is where a failure to start belongs.
+   */
+  const takeSnapshot = useCallback(async () => {
+    if (!sessionId || playback) {
+      store.addHostLog('warn', 'A heap snapshot needs a live target; replaying a recording has none.');
+      return;
+    }
+
+    try {
+      await api.sendSessionCommand(sessionId, { cmd: 'snapshot' });
+    } catch (snapshotError) {
+      const message = messageOf(snapshotError);
+      setError(message);
+      store.addHostLog('error', message);
+    }
+  }, [sessionId, playback, store]);
+
   const resetCounters = useCallback(async () => {
     if (sessionId && !playback) {
       await api.sendSessionCommand(sessionId, { cmd: 'reset' }).catch(() => undefined);
@@ -476,6 +499,7 @@ export function App() {
       if (target) setActivePanel(target);
     },
     onResetCounters: () => void resetCounters(),
+    onTakeSnapshot: () => void takeSnapshot(),
     onSaveSettings: saveSettings,
     onRefreshCollector: refreshCollector,
   };

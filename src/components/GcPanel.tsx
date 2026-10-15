@@ -28,23 +28,26 @@ export function GcPanel({ store }: Props) {
         color: heapColors[key],
         points: store.heapHistory.map((point) => ({ t: point.t, v: point[key] as number })),
       })),
-    [store],
+    // Every snapshot below has to depend on `store.version`: `store` itself is a stable
+    // reference, so depending on it alone pinned these lists to their first render and the
+    // panel contradicted itself — "63 collections observed" beside a list that stopped at 46.
+    [store, store.version],
   );
 
-  const recent = useMemo(() => [...store.gcEvents].reverse().slice(0, 60), [store]);
+  const recent = useMemo(() => [...store.gcEvents].reverse().slice(0, 60), [store, store.version]);
   const maxPause = Math.max(1, ...recent.map((event) => event.pauseMs ?? 0));
 
   const byGeneration = useMemo(() => {
     const counts = new Map<number, number>();
     for (const event of store.gcEvents) counts.set(event.generation, (counts.get(event.generation) ?? 0) + 1);
     return counts;
-  }, [store]);
+  }, [store, store.version]);
 
   const reasons = useMemo(() => {
     const counts = new Map<string, number>();
     for (const event of store.gcEvents) counts.set(event.reasonName, (counts.get(event.reasonName) ?? 0) + 1);
     return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
-  }, [store]);
+  }, [store, store.version]);
 
   const totalPause = store.gcEvents.reduce((sum, event) => sum + (event.pauseMs ?? 0), 0);
   const background = store.gcEvents.filter((event) => event.isBackground).length;

@@ -573,9 +573,13 @@ fn a_deep_capture_resolves_allocation_call_sites() {
         &location,
         SessionRequest {
             pid,
-            // Only the sampler and its post-session analysis: this test measures call-site
-            // resolution, not the live probes, and the sampler alone is the cheap part.
-            probes: vec!["allocation-sites".to_string()],
+            // The sampler *and* the live per-type probe, because that is the combination a user
+            // actually arms to find a leaking line and the two share one EventPipe session. This
+            // test used to run the sampler alone, and that blind spot hid a real defect: with the
+            // capture's keywords merged in, the runtime stops raising the `GC/AllocationTick`
+            // events the live probe matched on, so it reported nothing while the capture file
+            // beside it held thousands of samples.
+            probes: vec!["allocations".to_string(), "allocation-sites".to_string()],
             interval_ms: Some(500),
             max_types: Some(60),
             verbose: false,
@@ -604,6 +608,40 @@ fn a_deep_capture_resolves_allocation_call_sites() {
 
     // Long enough for the sampler to see a few hundred thousand allocations in `cache` mode.
     thread::sleep(Duration::from_secs(8));
+
+    // While the capture is still running, the live per-type data has to be arriving too. The
+    // basis is asserted only to be one of the two known values rather than the measured
+    // `allocationSampling`, so a future runtime that goes back to ticks fails nothing here —
+    // what must never come back is the empty payload.
+    assert!(
+        sink.wait_for("allocation.sample", 2, Duration::from_secs(10)),
+        "a capture-armed session reported no live allocation samples; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
+    let live_samples = sink.of_type("allocation.sample");
+    let live = &live_samples[live_samples.len() - 1]["data"];
+
+    let basis = live["samplingBasis"].as_str().unwrap_or("");
+    assert!(
+        basis == "tick" || basis == "allocationSampling",
+        "allocation samples must name which event kind produced them, got {basis:?}"
+    );
+
+    let live_types = live["types"]
+        .as_array()
+        .expect("allocation.sample must carry a types array");
+    assert!(
+        !live_types.is_empty(),
+        "the live type list was empty in a capturing session: {live}"
+    );
+    assert!(
+        live_types
+            .iter()
+            .any(|entry| entry["intervalBytes"].as_f64().unwrap_or(0.0) > 0.0),
+        "no live type reported any allocation volume: {live}"
+    );
+
     handle.stop();
 
     assert!(
@@ -874,6 +912,238 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
 
     let _ = std::fs::remove_dir_all(&capture_dir);
     let _ = std::fs::remove_dir_all(&app_dir);
+}
+
+/// The heap snapshot, which is the one probe whose answer is a graph rather than a number.
+///
+/// The property under test is not "some bytes came back". It is the claim the panel makes to the
+/// user: for the sample's leaking cache, the walk names the objects that survive and the chain of
+/// references that keeps them alive — so the assertions follow one type all the way from a root to
+/// an instance, and check the walk's own completeness accounting while doing it.
+///
+/// The session deliberately enables *only* this probe. That is the case where the shared session
+/// needs no providers at all, because the walk brings its own.
+#[test]
+fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
+    let Some(guard) = spawn_sample() else {
+        panic!("sample not built. Run `npm run sample:build` first");
+    };
+
+    thread::sleep(Duration::from_millis(1500));
+
+    let location = collector::locate_collector();
+    assert_located(&location);
+
+    let pid = guard.0.id() as i32;
+    let sink = Arc::new(RecordingSink::default());
+
+    let handle = collector::start_session(
+        sink.clone(),
+        &location,
+        SessionRequest {
+            pid,
+            probes: vec!["heap-snapshot".to_string()],
+            interval_ms: Some(1000),
+            max_types: Some(60),
+            verbose: false,
+            deep_capture: false,
+            record: false,
+            record_path: None,
+            target_name: None,
+            target_runtime: None,
+        },
+        None,
+    )
+    .expect("session must start");
+
+    assert!(
+        sink.wait_for("session.started", 1, Duration::from_secs(10)),
+        "no session.started message arrived; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
+    handle
+        .send_command(serde_json::json!({ "cmd": "snapshot" }))
+        .expect("the snapshot command must reach the collector");
+
+    assert!(
+        sink.wait_for("command.result", 1, Duration::from_secs(10)),
+        "the snapshot request was never acknowledged; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
+    // A walk of a heap that has been leaking for a couple of seconds is quick, but the collector
+    // allows two minutes before it gives up, so the test waits past the collector's own deadline
+    // only when something is genuinely wrong.
+    assert!(
+        sink.wait_for("heap.snapshot", 1, Duration::from_secs(150)),
+        "no heap snapshot arrived; logs: {:?}",
+        sink.logs.lock().unwrap()
+    );
+
+    let snapshots = sink.of_type("heap.snapshot");
+    let data = &snapshots[0]["data"];
+
+    let object_count = data["objectCount"].as_u64().expect("objectCount must be a number");
+    let total_bytes = data["totalBytes"].as_u64().expect("totalBytes must be a number");
+    let reachable = data["reachableObjects"].as_u64().expect("reachableObjects must be a number");
+    let edge_count = data["edgeCount"].as_u64().expect("edgeCount must be a number");
+
+    assert!(object_count > 1_000, "the sample holds far more than {object_count} objects");
+    assert!(total_bytes > 0, "a snapshot with no live bytes is not a snapshot");
+    assert!(edge_count > 0, "a graph with no references cannot answer what holds what");
+    assert!(
+        data["pauseMs"].as_u64().is_some_and(|pause| pause > 0),
+        "the walk must report the pause it cost the target, not hide it"
+    );
+    assert!(
+        data["note"].as_str().is_some_and(|note| !note.is_empty()),
+        "the snapshot must carry the caveat the UI shows verbatim"
+    );
+
+    // The walk is checked against itself here rather than taken on trust. A graph the runtime
+    // truncated looks exactly like a small heap from the inside, so the two fields that disagree
+    // with it — how many objects a root reaches, and how the byte total compares with the size the
+    // runtime reported for the same collection — are what the panel warns on, and what this test
+    // pins down.
+    if let Some(note) = data["coverageNote"].as_str() {
+        // A partial walk must say so *and* withhold its paths: a chain drawn through a graph with
+        // references missing is a guess, which is the one thing this payload must never be.
+        assert!(
+            data["retention"].as_array().is_some_and(|paths| paths.is_empty()),
+            "a partial walk must not also report retention paths, but {note} came with paths"
+        );
+        panic!("the walk of a freshly started sample came back partial: {note}");
+    }
+
+    assert!(
+        reachable * 100 / object_count > 95,
+        "only {reachable} of {object_count} walked objects were reachable from a root"
+    );
+
+    let types = data["types"].as_array().expect("types must be an array");
+    let session_record = types
+        .iter()
+        .find(|entry| entry["typeName"] == "SessionRecord")
+        .unwrap_or_else(|| panic!("the leaking cache's element type was not reported: {types:?}"));
+
+    assert!(
+        session_record["objectCount"].as_u64().is_some_and(|count| count > 1_000),
+        "the sample's cache should hold thousands of records by the time it is walked: {session_record}"
+    );
+    assert!(
+        session_record["liveBytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "SessionRecord must account for live bytes: {session_record}"
+    );
+
+    // "What would be freed" is a different number from "what it occupies", and the sample is the
+    // case where the two must differ: every record holds a 256-byte payload, so removing the records
+    // frees far more than the records themselves. If the retained measure were ever accidentally
+    // wired to the live one, this is what would catch it.
+    let live = session_record["liveBytes"].as_u64().expect("liveBytes must be a number");
+    let retained = session_record["retainedBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("SessionRecord has no retained size: {session_record}"));
+
+    assert!(
+        retained > live,
+        "removing the sample's records must free more than the records themselves \
+         (live {live} bytes, freed {retained} bytes)"
+    );
+    assert!(
+        retained <= total_bytes,
+        "a type cannot free more than the whole heap ({retained} > {total_bytes})"
+    );
+
+    // The answer the panel exists to give: the chain from a root to one live instance.
+    let retention = data["retention"].as_array().expect("retention must be an array");
+    let path = retention
+        .iter()
+        .find(|path| path["typeName"] == "SessionRecord")
+        .unwrap_or_else(|| {
+            panic!("no retention path to the leakiest type was reported: {retention:?}")
+        });
+
+    assert!(
+        path["truncated"].as_bool() == Some(false),
+        "the path to the cache's records is short enough to reach the root: {path}"
+    );
+
+    let frames = path["frames"].as_array().expect("a path must carry its frames");
+    assert!(frames.len() >= 2, "a one-frame path names nothing: {path}");
+
+    // Root first, object last — the order the panel renders and the order the answer is read in.
+    let last = frames.last().unwrap();
+    assert_eq!(last["typeName"], "SessionRecord", "the chain must end at the type it explains");
+
+    for frame in frames {
+        assert!(
+            frame["typeName"].as_str().is_some_and(|name| !name.is_empty())
+                && frame["label"].as_str().is_some_and(|label| !label.is_empty())
+                && frame["size"].as_u64().is_some(),
+            "every frame must name what it is, what points at it and how big it is: {frame}"
+        );
+
+        // Each frame carries what it alone holds, which is what makes a chain readable: the small
+        // dictionary above the entry array is the frame that explains the leak, and only this number
+        // says so. It can never be less than the object's own size.
+        let size = frame["size"].as_u64().expect("frame size must be a number");
+        let frame_retained = frame["retainedBytes"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("frame has no retained size: {frame}"));
+
+        assert!(
+            frame_retained >= size,
+            "an object always frees at least itself ({frame_retained} < {size}): {frame}"
+        );
+        assert!(
+            frame_retained <= total_bytes,
+            "a frame cannot hold more than the whole heap ({frame_retained} > {total_bytes}): {frame}"
+        );
+    }
+
+    // The dictionary that holds the records has to appear in the chain, because it is the reason
+    // the records are alive at all. A path that skipped it would be a path through nothing.
+    assert!(
+        frames.iter().any(|frame| frame["typeName"]
+            .as_str()
+            .is_some_and(|name| name.contains("Dictionary"))),
+        "the chain does not pass through the cache that holds the records: {path}"
+    );
+    assert!(
+        frames.iter().any(|frame| frame["typeName"]
+            .as_str()
+            .is_some_and(|name| name.contains("Entry"))),
+        "the chain does not pass through the dictionary's entry array, which is what holds every \
+         record in one object: {path}"
+    );
+
+    // The root frame is the reference that has to be cut, so it is asserted to be a real one.
+    let root = &frames[0];
+    assert!(
+        root["label"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("static ") || label.starts_with("GC root (")),
+        "the first frame must be a root the runtime named, not a guessed one: {root}"
+    );
+    assert_eq!(
+        path["rootLabel"], root["label"],
+        "rootLabel must agree with the first frame, or the summary and the chain disagree"
+    );
+
+    // Which events actually arrived, so a graph built from a partial stream is visible rather
+    // than inferred from numbers that look plausible.
+    assert!(
+        data["inventory"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry
+                .as_str()
+                .is_some_and(|name| name.starts_with("GC/BulkNode")))),
+        "the snapshot must report the heap-graph events it saw: {:?}",
+        data["inventory"]
+    );
+
+    handle.stop();
 }
 
 /// Guards against the collector silently disappearing from the expected build locations.

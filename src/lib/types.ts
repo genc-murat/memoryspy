@@ -62,12 +62,26 @@ export interface TypeSnapshot {
   lastSeenUnixMs: number;
 }
 
+/**
+ * Which event kind the allocation numbers came from.
+ *
+ * The runtime picks it from the session's keywords: `tick` is one `GC/AllocationTick` per
+ * ~100 KB allocated, `allocationSampling` is one event per sampled allocation carrying the
+ * object's own size — which is what a deep-capture session gets instead. Shares are unbiased
+ * on both, absolute volumes are on different scales, so the UI must not present the two as
+ * the same number. Null only when a payload predates the field.
+ */
+export type AllocationSamplingBasis = 'tick' | 'allocationSampling';
+
 export interface AllocationSampleData {
   intervalMs: number;
   totalIntervalBytes: number;
   totalIntervalTicks: number;
   totalBytes: number;
   totalTicks: number;
+  /** Basis of the numbers in this interval; see {@link AllocationSamplingBasis}. */
+  samplingBasis?: AllocationSamplingBasis | null;
+  /** How much allocation one tick stands for; 0 when the basis is `allocationSampling`. */
   tickApproximateBytes: number;
   typeCount: number;
   types: TypeSnapshot[];
@@ -119,6 +133,113 @@ export interface GcSummaryData {
 export interface LogData {
   level: string;
   message: string;
+}
+
+// ---------------------------------------------------------------------------------------
+// Heap snapshot (a walk of the live object graph)
+// ---------------------------------------------------------------------------------------
+
+/** One type's live footprint in a heap snapshot. */
+export interface HeapTypeSummary {
+  typeName: string;
+  objectCount: number;
+  liveBytes: number;
+  /** Fraction of the snapshot's live bytes, 0–1. */
+  share: number;
+  /**
+   * Bytes that would no longer be reachable if every object of this type were removed.
+   *
+   * A different measure from `liveBytes`, and the one that answers "what would I save?": it counts
+   * what the type holds transitively through the references only it provides. Computed by walking
+   * the graph without the type, so it is exact rather than estimated.
+   *
+   * Absent (not zero) for types outside the snapshot's retained-size budget, and absent for every
+   * type when `retainedNote` is set.
+   */
+  retainedBytes?: number | null;
+}
+
+/**
+ * One step of a retention path: what references the object, and what the object is.
+ *
+ * The label is never invented — it is a GC root kind, a static field name, or `field #n` for a
+ * reference the runtime reports by index, which is what keeps a chain traceable back to code.
+ */
+export interface RetentionFrame {
+  label: string;
+  typeName: string;
+  size: number;
+  /**
+   * Bytes this object exclusively holds — what would be freed if it became unreachable.
+   *
+   * Read along a chain it says where the weight sits: the small dictionary and the 92 MB array
+   * below it look alike until this column reports that one of them holds the heap. Absent when the
+   * snapshot's retained-size budget did not reach it, or did not run.
+   */
+  retainedBytes?: number | null;
+}
+
+/** A reference chain from a GC root to one live instance of a type. Root first, object last. */
+export interface RetentionPath {
+  typeName: string;
+  rootLabel: string;
+  depth: number;
+  /** True when the chain hit the depth limit, so it starts below the real root. */
+  truncated: boolean;
+  frames: RetentionFrame[];
+}
+
+/**
+ * The `heap.snapshot` payload: every live object at one blocking collection.
+ *
+ * Not a sample. The runtime walks the heap during a Gen 2 collection, so the totals are exact
+ * accounting at that instant rather than a scaled estimate — and the cost is a real pause in
+ * the target, which `pauseMs` reports.
+ *
+ * `liveBytes` is what a type's objects occupy; `retainedBytes` is what would actually be freed if
+ * they went away, which is a different and usually larger number. Both are reported because they
+ * answer different questions, and the payload's `note` spells out the difference.
+ */
+export interface HeapSnapshotData {
+  snapshotId: number;
+  startedAtUnixMs: number;
+  /** How long the whole walk took, including the pause. */
+  durationMs: number;
+  /** How long the snapshot collection stopped the target. */
+  pauseMs: number;
+  gcNumber: number;
+  /** True when the walk was cut short by its deadline rather than finishing. */
+  incomplete: boolean;
+  objectCount: number;
+  totalBytes: number;
+  /** Objects a root can reach. The rest are counted, not hidden. */
+  reachableObjects: number;
+  /** The heap size the runtime reported for the same collection; 0 when it said nothing. */
+  heapBytesReportedByGc: number;
+  edgeCount: number;
+  rootCount: number;
+  staticRootCount: number;
+  typeCount: number;
+  /** Objects whose type the walk never named. Reported rather than guessed. */
+  unknownTypeObjects: number;
+  types: HeapTypeSummary[];
+  retention: RetentionPath[];
+  /** Which events the session actually saw, as a check that the provider delivered. */
+  inventory: string[];
+  /** Set when the delivered references did not match what the objects declared. */
+  edgeAlignmentNote?: string | null;
+  /**
+   * Set when the walk is known to be a partial view of the heap, with the evidence for it. When
+   * present the totals are a floor and `retention` is empty — see the collector's own wording.
+   */
+  coverageNote?: string | null;
+  /**
+   * Set when retained sizes are absent or only partly reported, with the reason. When present, the
+   * missing `retainedBytes` fields are not to be read as zero.
+   */
+  retainedNote?: string | null;
+  /** The caveat to show verbatim. */
+  note: string;
 }
 
 /** The envelope every collector line is wrapped in. */

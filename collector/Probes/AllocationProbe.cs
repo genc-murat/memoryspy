@@ -9,11 +9,24 @@ namespace MemorySpy.Collector.Probes;
 /// <summary>
 /// Answers the question "which class is growing?".
 ///
-/// The runtime samples allocations roughly every 100 KB and raises
-/// <c>GC/AllocationTick</c> with the allocated type's name
-/// (available because the <c>GCHeapAndTypeNames</c> keyword is enabled). Aggregating
-/// those ticks per type over an interval gives an allocation-rate leaderboard, which is
-/// the fastest way to spot the object that keeps piling up.
+/// The runtime samples allocations and reports them with the allocated type's name
+/// (available because the <c>GCHeapAndTypeNames</c> keyword is enabled). Aggregating those
+/// samples per type over an interval gives an allocation-rate leaderboard, which is the
+/// fastest way to spot the object that keeps piling up.
+///
+/// <para>
+/// Two event kinds carry that sample, and which one arrives is decided by the session's
+/// keywords, not by this probe (see <see cref="BasisTick"/> and
+/// <see cref="BasisAllocationSampling"/>): with <c>GC | GCHeapAndTypeNames</c> alone the
+/// runtime raises a tick roughly every 100 KB, while a session that also enables
+/// <c>AllocationSampling</c> — which the call-site probe must, because the older
+/// sampled-allocation mechanism emits nothing on .NET 10 — raises per-allocation samples and
+/// no ticks at all. Matching only the tick name therefore blanked this panel for exactly the
+/// session the user had armed to find a leaking line: measured on .NET 10.0.9, 758 ticks
+/// (7 intervals of samples) without a capture and 776 <c>AllocationSampling</c> events with
+/// one, of which this probe accepted none. Both kinds are read now, and the basis that was
+/// actually used travels with the numbers.
+/// </para>
 ///
 /// Note the deliberate distinction between <em>allocated</em> and <em>retained</em>:
 /// allocation volume tells you what is being created, while growth of the heap tells you
@@ -26,6 +39,21 @@ public sealed class AllocationProbe : ICollectorProbe
     private const long KeywordGc = 0x1;
     private const long KeywordGcHeapAndTypeNames = 0x01000000;
 
+    /// <summary>
+    /// Basis reported when the runtime sent <c>GC/AllocationTick</c> (id 10): one event per
+    /// ~100 KB of allocation, so the volume attributed to a type is a scaled estimate.
+    /// </summary>
+    public const string BasisTick = "tick";
+
+    /// <summary>
+    /// Basis reported when the runtime sent <c>AllocationSampling</c> (id 303): one event per
+    /// sampled allocation, carrying that object's own size. Shares between types are unbiased,
+    /// but the volumes are on a much smaller scale than the tick basis — measured against the
+    /// leaking sample, 17.9 MB/s on the tick basis against 0.04 MB/s on this one — so the two
+    /// are never presented as if they were the same number.
+    /// </summary>
+    public const string BasisAllocationSampling = "allocationSampling";
+
     private ProbeContext _context = null!;
     private readonly object _gate = new();
     private readonly Dictionary<string, TypeAccumulator> _types = new(StringComparer.Ordinal);
@@ -34,6 +62,9 @@ public sealed class AllocationProbe : ICollectorProbe
     private long _totalBytes;
     private long _totalTicks;
     private long _lastFlushTicks = Environment.TickCount64;
+
+    /// <summary>Which event kind is feeding the numbers right now, or null before the first.</summary>
+    private string? _basis;
 
     public string Id => "allocations";
     public string DisplayName => "Allocations by Type";
@@ -55,35 +86,37 @@ public sealed class AllocationProbe : ICollectorProbe
 
     public void OnEvent(TraceEvent ev)
     {
-        if (!ev.EventName.EndsWith("AllocationTick", StringComparison.Ordinal))
+        // Both names, because the runtime picks the event kind from the session's keywords:
+        // a capture-armed session gets AllocationSampling and no ticks at all.
+        var isSample = ev.EventName.Contains("AllocationSampling", StringComparison.Ordinal);
+        var isTick = !isSample && ev.EventName.EndsWith("AllocationTick", StringComparison.Ordinal);
+        if (!isSample && !isTick)
             return;
 
         var typeName = ev.PayloadByName("TypeName")?.ToString();
         if (string.IsNullOrWhiteSpace(typeName))
             return;
 
-        long bytes = 0;
-        try
-        {
-            bytes = Convert.ToInt64(ev.PayloadByName("AllocationAmount64") ?? ev.PayloadByName("AllocationAmount") ?? 0L);
-        }
-        catch
-        {
-            // Older payload revisions may not carry the 64-bit field; fall back to the tick size.
-        }
+        var objectSize = ReadLong(ev, "ObjectSize");
 
-        var objectSize = 0L;
-        try
+        long bytes;
+        if (isSample)
         {
-            objectSize = Convert.ToInt64(ev.PayloadByName("ObjectSize") ?? 0L);
+            // A per-allocation sample reports the allocated object's own size, which is both the
+            // volume and the object size; there is no tick to scale it from.
+            bytes = objectSize > 0 ? objectSize : ReadLong(ev, "AllocationAmount64");
         }
-        catch
+        else
         {
-            // Ignore — ObjectSize is informational only.
+            bytes = ReadLong(ev, "AllocationAmount64");
+            if (bytes <= 0)
+                bytes = ReadLong(ev, "AllocationAmount");
         }
 
         lock (_gate)
         {
+            _basis = isSample ? BasisAllocationSampling : BasisTick;
+
             if (!_types.TryGetValue(typeName, out var acc))
             {
                 acc = new TypeAccumulator(typeName, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -95,6 +128,22 @@ public sealed class AllocationProbe : ICollectorProbe
             _intervalTicks++;
             _totalBytes += bytes;
             _totalTicks++;
+        }
+    }
+
+    /// <summary>
+    /// Reads a numeric payload field, tolerating the payload revisions that carry different
+    /// width fields. A missing or unparsable field reads as 0 rather than throwing.
+    /// </summary>
+    private static long ReadLong(TraceEvent ev, string field)
+    {
+        try
+        {
+            return Convert.ToInt64(ev.PayloadByName(field) ?? 0L);
+        }
+        catch
+        {
+            return 0;
         }
     }
 
@@ -135,20 +184,32 @@ public sealed class AllocationProbe : ICollectorProbe
             totalIntervalTicks = intervalTicks,
             totalBytes,
             totalTicks,
-            // The runtime samples roughly one event per 100 KB of allocation; exposed so the
-            // UI can label the numbers as estimates rather than exact accounting.
-            tickApproximateBytes = 100 * 1024,
+            // Which event kind produced these numbers, so the UI can label them for what they
+            // are: a capture-armed session reports per-allocation samples, not 100 KB ticks.
+            samplingBasis = _basis,
+            // How much allocation one tick stands for. Only meaningful on the tick basis; on the
+            // sample basis each event carries its object's size instead, so this is reported as 0.
+            tickApproximateBytes = _basis == BasisAllocationSampling ? 0 : TickApproximateBytes,
             typeCount = _types.Count,
             types = ranked,
         });
     }
 
+    /// <summary>How much allocation one <c>GC/AllocationTick</c> stands for.</summary>
+    private const int TickApproximateBytes = 100 * 1024;
+
     public IReadOnlyDictionary<string, object?> Describe() => new Dictionary<string, object?>
     {
         ["provider"] = "Microsoft-Windows-DotNETRuntime",
-        ["event"] = "GC/AllocationTick",
-        ["keywords"] = "GC | GCHeapAndTypeNames",
-        ["sampling"] = "The runtime samples roughly every 100 KB of allocation; values are scaled estimates, not exact accounting.",
+        ["event"] = "GC/AllocationTick (id 10) or AllocationSampling (id 303)",
+        ["keywords"] = "GC | GCHeapAndTypeNames (+ AllocationSampling when a deep capture is armed)",
+        ["sampling"] =
+            "The runtime samples allocations rather than logging every one, so values are estimates: " +
+            "with the plain keyword set it raises one AllocationTick per ~100 KB allocated, and in a " +
+            "session that has a deep capture armed it raises per-allocation AllocationSampling events " +
+            "carrying the object's own size instead. Which one is in force is reported per interval as " +
+            "samplingBasis; shares between types are unbiased on either basis, absolute volumes are not " +
+            "comparable across the two.",
         ["columns"] = new[]
         {
             new { key = "typeName", label = "Type" },
@@ -167,6 +228,7 @@ public sealed class AllocationProbe : ICollectorProbe
             _types.Clear();
             _intervalBytes = _intervalTicks = 0;
             _totalBytes = _totalTicks = 0;
+            _basis = null;
             _lastFlushTicks = Environment.TickCount64;
         }
     }

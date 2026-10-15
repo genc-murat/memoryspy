@@ -49,6 +49,13 @@ public static class MessageType
     /// stacks can only be named from a complete file.
     /// </summary>
     public const string AllocationSite = "allocation.site";
+    /// <summary>
+    /// A live object graph taken on demand: objects and bytes per type, plus the reference chain
+    /// from a GC root to the largest instances. Unlike the other probes this one runs its own
+    /// short EventPipe session, because the heap-walk keyword it needs must never be merged into
+    /// the shared session.
+    /// </summary>
+    public const string HeapSnapshot = "heap.snapshot";
     public const string HeapStats = "heap.stats";
     public const string GcEvent = "gc.event";
     public const string GcSummary = "gc.summary";

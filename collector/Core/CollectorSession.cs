@@ -1,3 +1,4 @@
+using System.Diagnostics.Tracing;
 using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Diagnostics.Tracing;
 using MemorySpy.Collector.Probes;
@@ -79,9 +80,25 @@ public sealed class CollectorSession : IDisposable
 
         if (providers.Count == 0)
         {
-            _emitter.Error("No EventPipe providers would be enabled by this selection. " +
-                           "The allocation-sites probe needs --capture <path> to do anything.");
-            return 1;
+            // A selection can legitimately want nothing from this session: the heap-snapshot probe
+            // opens a session of its own when it is asked for a walk, so `--probes heap-snapshot`
+            // enables no provider here and is still a working session. It is only a dead end when a
+            // probe that does want events from this session got none — which for the allocation-sites
+            // probe means the capture it reads had nowhere to be written.
+            if (captureConsumers.Count > 0 && !captureEnabled)
+            {
+                _emitter.Error("No EventPipe providers would be enabled by this selection. " +
+                               "The allocation-sites probe needs --capture <path> to do anything.");
+                return 1;
+            }
+
+            // Keep a session open anyway: it is what reports the target exiting and what carries the
+            // command channel, and a snapshot is triggered over that channel. The runtime provider at
+            // Critical level enables no keyword, so it costs a session and no events.
+            providers = ProviderMerger.Merge(new[]
+            {
+                new EventPipeProvider("Microsoft-Windows-DotNETRuntime", EventLevel.Critical, keywords: 0),
+            });
         }
 
         _emitter.Emit(MessageType.SessionStarted, null, new

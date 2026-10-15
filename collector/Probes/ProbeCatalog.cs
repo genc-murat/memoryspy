@@ -18,6 +18,7 @@ public static class ProbeCatalog
         static () => new AllocationProbe(),
         static () => new AllocationSiteProbe(),
         static () => new GcStatsProbe(),
+        static () => new HeapSnapshotProbe(),
     };
 
     public static IReadOnlyList<ICollectorProbe> CreateAll()

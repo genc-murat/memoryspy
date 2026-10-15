@@ -23,6 +23,7 @@ import type {
   CounterReading,
   DotnetProcessInfo,
   EnvironmentInfo,
+  HeapSnapshotData,
   HeapStatsData,
   PlaybackState,
   PlaybackStatusEvent,
@@ -115,8 +116,17 @@ const CAPABILITIES: Capabilities = {
       eventTypes: ['heap.stats', 'gc.event', 'gc.summary'],
       details: {},
     },
+    {
+      id: 'heap-snapshot',
+      displayName: 'Heap Snapshot',
+      description: 'Walks the live object graph on demand: what survives collection, and which root keeps it alive.',
+      icon: 'layers',
+      channel: 'None',
+      eventTypes: ['heap.snapshot'],
+      details: {},
+    },
   ],
-  enabledProbes: ['runtime-counters', 'allocations', 'allocation-sites', 'gc-stats'],
+  enabledProbes: ['runtime-counters', 'allocations', 'allocation-sites', 'gc-stats', 'heap-snapshot'],
   options: { pid: 4242, intervalMs: 1000, maxAllocationTypes: 150 },
   target: null,
 };
@@ -229,6 +239,9 @@ function tick(elapsedSeconds: number): CollectorMessage[] {
       totalIntervalTicks: 168,
       totalBytes: types.reduce((sum, entry) => sum + entry.totalBytes, 0),
       totalTicks: 168 * Math.round(elapsedSeconds),
+      // The mock plays the plain (uncaptured) session, which is the tick basis: a real capture
+      // session reports 'allocationSampling' and 0 here instead.
+      samplingBasis: 'tick',
       tickApproximateBytes: 100 * 1024,
       typeCount: types.length,
       types,
@@ -720,6 +733,131 @@ function syntheticRecording(
 
 let mockRecordingSequence = 0;
 
+/**
+ * A synthetic heap walk of the same story the mock's allocation numbers tell: a session cache that
+ * is only ever added to.
+ *
+ * The retention chain is the point of the payload, so it is a real chain rather than filler — a
+ * static field on the service's cache type, the dictionary it holds, that dictionary's entry array,
+ * and the record the chain was built for. The sizes descend the way a real walk reports them, which
+ * is what makes the panel's question (“which of these do I cut?”) answerable from the mock.
+ */
+function buildMockSnapshot(): HeapSnapshotData {
+  const MB = 1024 * 1024;
+
+  return {
+    snapshotId: 1,
+    startedAtUnixMs: Date.now() - 3_400,
+    durationMs: 3_412,
+    pauseMs: 1_284,
+    gcNumber: 41,
+    incomplete: false,
+    objectCount: 3_412_887,
+    totalBytes: 812 * MB,
+    reachableObjects: 3_412_140,
+    heapBytesReportedByGc: 826 * MB,
+    edgeCount: 4_120_338,
+    rootCount: 214,
+    staticRootCount: 402,
+    typeCount: 187,
+    unknownTypeObjects: 0,
+    types: [
+      { typeName: 'System.Byte[]', objectCount: 1_204_882, liveBytes: 322 * MB, share: 0.397, retainedBytes: 322 * MB },
+      { typeName: 'OrderService.Storage.SessionRecord', objectCount: 1_204_879, liveBytes: 96 * MB, share: 0.118, retainedBytes: 618 * MB },
+      { typeName: 'System.String', objectCount: 1_204_774, liveBytes: 88 * MB, share: 0.108, retainedBytes: 88 * MB },
+      {
+        typeName: 'System.Collections.Generic.Dictionary`2+Entry[System.Guid,OrderService.Storage.SessionRecord][]',
+        objectCount: 1,
+        liveBytes: 74 * MB,
+        share: 0.091,
+        retainedBytes: 700 * MB,
+      },
+      { typeName: 'System.Char[]', objectCount: 611_204, liveBytes: 31 * MB, share: 0.038, retainedBytes: 31 * MB },
+      { typeName: 'System.Object[]', objectCount: 41_882, liveBytes: 9 * MB, share: 0.011, retainedBytes: 9 * MB },
+    ],
+    retention: [
+      {
+        typeName: 'OrderService.Storage.SessionRecord',
+        rootLabel: 'static OrderService.Storage.SessionCache.Instances',
+        depth: 4,
+        truncated: false,
+        frames: [
+          {
+            label: 'static OrderService.Storage.SessionCache.Instances',
+            typeName: 'System.Collections.Generic.Dictionary`2[System.Guid,OrderService.Storage.SessionRecord]',
+            size: 80,
+            retainedBytes: 700 * MB,
+          },
+          {
+            label: 'field #0',
+            typeName: 'System.Collections.Generic.Dictionary`2+Entry[System.Guid,OrderService.Storage.SessionRecord][]',
+            size: 74 * MB,
+            retainedBytes: 700 * MB,
+          },
+          { label: 'field #3', typeName: 'OrderService.Storage.SessionRecord', size: 84, retainedBytes: 364 },
+        ],
+      },
+      {
+        typeName: 'System.Byte[]',
+        rootLabel: 'static OrderService.Storage.SessionCache.Instances',
+        depth: 5,
+        truncated: false,
+        frames: [
+          {
+            label: 'static OrderService.Storage.SessionCache.Instances',
+            typeName: 'System.Collections.Generic.Dictionary`2[System.Guid,OrderService.Storage.SessionRecord]',
+            size: 80,
+            retainedBytes: 700 * MB,
+          },
+          {
+            label: 'field #0',
+            typeName: 'System.Collections.Generic.Dictionary`2+Entry[System.Guid,OrderService.Storage.SessionRecord][]',
+            size: 74 * MB,
+            retainedBytes: 700 * MB,
+          },
+          { label: 'field #3', typeName: 'OrderService.Storage.SessionRecord', size: 84, retainedBytes: 364 },
+          { label: 'field #1', typeName: 'System.Byte[]', size: 280, retainedBytes: 280 },
+        ],
+      },
+      {
+        typeName: 'System.String',
+        rootLabel: 'GC root (Handle)',
+        depth: 6,
+        truncated: false,
+        frames: [
+          { label: 'GC root (Handle)', typeName: 'System.Threading.TimerQueue', size: 80, retainedBytes: 700 * MB },
+          { label: 'field #0', typeName: 'System.Threading.TimerQueueTimer', size: 96, retainedBytes: 700 * MB },
+          { label: 'field #0', typeName: 'OrderService.Storage.SessionSweeper+<>c__DisplayClass2_0', size: 48, retainedBytes: 700 * MB },
+          {
+            label: 'field #0',
+            typeName: 'System.Collections.Generic.Dictionary`2[System.Guid,OrderService.Storage.SessionRecord]',
+            size: 80,
+            retainedBytes: 700 * MB,
+          },
+          { label: 'field #0', typeName: 'System.String', size: 62, retainedBytes: 62 },
+        ],
+      },
+    ],
+    inventory: [
+      'GC/BulkNode x1871',
+      'GC/BulkEdge x402',
+      'Type/BulkType x9',
+      'GC/Start x4',
+      'GC/Stop x4',
+      'GC/HeapStats x4',
+      'GC/BulkRootStaticVar x1',
+      'GC/BulkRootEdge x1',
+    ],
+    edgeAlignmentNote: null,
+    coverageNote: null,
+    note:
+      'Exact live objects at the snapshot collection, not a sampled estimate. Live bytes is what a type\u2019s ' +
+      'objects occupy; freed-if-removed is the different question — the live bytes that would no longer be ' +
+      'reachable if every object of that type went away — which is why a small type can free far more than it ' +
+      'occupies.',
+  };
+}
+
 /** Begins a synthetic recording, exactly as `start_recording` would. */
 function openMockRecording(targetName: string): RecordingSummary {
   const recording = syntheticRecording(
@@ -882,7 +1020,32 @@ export const mockApi = {
   stopAllSessions: async () => {
     stopMockStream();
   },
-  sendSessionCommand: async () => undefined,
+  /**
+   * Honours the heap walk the way the collector does: it acknowledges the request at once and the
+   * snapshot itself arrives later, because a real walk stops the target for a collection. The
+   * delay is what makes the button's “walking” state visible in the mock.
+   */
+  sendSessionCommand: async (_sessionId: string, command: Record<string, unknown>) => {
+    if (command?.cmd !== 'snapshot') return;
+
+    handlers?.messages({
+      sessionId: SESSION_ID,
+      messages: [
+        envelope('command.result', null, {
+          cmd: 'snapshot',
+          ok: true,
+          detail: 'Heap snapshot started: the target will pause for one Gen 2 collection while it is walked.',
+        }),
+      ],
+    });
+
+    setTimeout(() => {
+      handlers?.messages({
+        sessionId: SESSION_ID,
+        messages: [envelope('heap.snapshot', 'heap-snapshot', buildMockSnapshot())],
+      });
+    }, 2500);
+  },
   listSessions: async (): Promise<SessionSnapshot[]> => [],
   pruneSessions: async () => 0,
   getSettings: async () => SETTINGS,

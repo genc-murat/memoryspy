@@ -176,6 +176,19 @@ four findings that are worth writing down because three of them contradict the o
    ignored by 10, and correct for a target started with tracing armed), and the analysis names
    the runtime version when it has to report an empty capture, so "your target predates
    attachable sampling" is a sentence the user reads rather than a zero they stare at.
+   
+   **The escape hatch for a pre-10 target is starting it armed.** The same env vars that arm
+   EventPipe at process start (`DOTNET_EnableEventPipe=1`, `DOTNET_EventPipeOutputPath`,
+   `DOTNET_EventPipeConfig=Microsoft-Windows-DotNETRuntime:0x3200001:5`) install the sampler
+   the attach cannot: measured on .NET 7.0.3, ~460 000 sampled allocations in twenty seconds
+   of a churning process, with every stack frame resolved. The costs are inherent to the
+   mechanism: the file exists only when the process exits (a graceful stop flushes it), and
+   the startup session never writes GC/BulkType events — tried with every plausible keyword
+   combination — so the type leaderboard in such a capture is "(unknown type)" throughout
+   while the call sites, shares and stacks are complete. The collector's `analyze` command
+   turns that file into the same `allocation.site` answer a session capture produces, and an
+   attached MemorySpy session coexists with the armed one (verified: live panels keep
+   streaming while the startup session records).
 2. **A live stack cannot be named.** `TraceEvent.CallStack()` throws on an
    `EventPipeEventSource` — *"Attempted to use TraceLog support on a non-TraceLog
    TraceEventSource"* — because an instruction pointer becomes a method name only after the

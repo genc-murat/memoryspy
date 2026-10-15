@@ -5,6 +5,7 @@ using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Diagnostics.Symbols;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Etlx;
+using Microsoft.Diagnostics.Tracing.Parsers.Clr;
 using MemorySpy.Collector.Core;
 using MemorySpy.Collector.Protocol;
 
@@ -883,6 +884,26 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
                 ? Path.GetFileName(Path.GetDirectoryName(coreLibPath))
                 : null;
 
+        // Legacy sampled allocations carry only a TypeID; the names live in GC/BulkType
+        // events, which the runtime writes at rundown — that is, after every allocation. The
+        // map is collected in a first pass so the folding pass can name types it meets
+        // earlier in the file. Without it, every type in a pre-.NET 10 capture reports as
+        // "(unknown type)" and the type leaderboard is useless.
+        Dictionary<ulong, string>? legacyTypeNames = null;
+        foreach (var ev in log.Events)
+        {
+            if (ev is not GCBulkTypeTraceData bulk)
+                continue;
+
+            legacyTypeNames ??= new Dictionary<ulong, string>();
+            for (var i = 0; i < bulk.Count; i++)
+            {
+                var values = bulk.Values(i);
+                if (!string.IsNullOrWhiteSpace(values.TypeName))
+                    legacyTypeNames[values.TypeID] = values.TypeName;
+            }
+        }
+
         foreach (var ev in log.Events)
         {
             var isModern = ev.EventName.Contains("AllocationSampling", StringComparison.Ordinal);
@@ -895,6 +916,15 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
             }
 
             var typeName = ReadString(ev, "TypeName");
+            if (string.IsNullOrWhiteSpace(typeName) &&
+                legacyTypeNames is not null &&
+                ev is GCSampledObjectAllocationTraceData legacy &&
+                legacyTypeNames.TryGetValue(legacy.TypeID, out var mapped))
+            {
+                // The legacy event names its type by ID; the BulkType pass holds the names.
+                typeName = mapped;
+            }
+
             if (string.IsNullOrWhiteSpace(typeName))
                 typeName = "(unknown type)";
 

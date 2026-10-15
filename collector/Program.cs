@@ -63,9 +63,71 @@ switch (args[0])
     case "watch":
         return RunWatch(args);
 
+    case "analyze":
+        return RunAnalyze(args);
+
     default:
         emitter.Error($"Unknown command '{args[0]}'. Run with --help for usage.");
         return 1;
+}
+
+/// <summary>
+/// Runs the call-site analysis on a capture that was produced outside a session.
+///
+/// This is the door for the one shape of evidence an attached session cannot produce: a
+/// target on a runtime before .NET 10 only arms the allocation sampler at process start, so
+/// its capture has to be taken by starting the process with EventPipe armed through the
+/// environment (<c>DOTNET_EnableEventPipe</c> and friends). The file lands on disk when that
+/// process exits, and this command is how it becomes the same <c>allocation.site</c> answer a
+/// deep capture inside a session would have produced.
+/// </summary>
+int RunAnalyze(string[] argv)
+{
+    string? capturePath = null;
+    var maxTypes = 150;
+
+    for (var i = 1; i < argv.Length; i++)
+    {
+        switch (argv[i])
+        {
+            case "--capture":
+                if (i + 1 >= argv.Length)
+                {
+                    emitter.Error("--capture requires a file path.");
+                    return 1;
+                }
+
+                capturePath = argv[++i];
+                break;
+
+            case "--max-types":
+                if (i + 1 >= argv.Length || !int.TryParse(argv[++i], out var parsed) || parsed < 1)
+                {
+                    emitter.Error("--max-types requires a positive integer.");
+                    return 1;
+                }
+
+                maxTypes = parsed;
+                break;
+
+            default:
+                emitter.Error($"Unknown option '{argv[i]}'. Run with --help for usage.");
+                return 1;
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(capturePath))
+    {
+        emitter.Error("analyze requires --capture <path to a .nettrace or .etl>.");
+        return 1;
+    }
+
+    var options = new CollectorOptions { MaxAllocationTypes = maxTypes };
+    var probe = new AllocationSiteProbe();
+    var context = new ProbeContext(probe.Id, emitter, options);
+    probe.Initialize(context);
+    probe.AnalyzeCapture(capturePath, context);
+    return 0;
 }
 
 int RunWatch(string[] argv)
@@ -350,6 +412,15 @@ static void PrintUsage()
 
           MemorySpy.Collector watch --pid <pid> [options]
               Attach to a process and stream metrics until it exits or 'stop' arrives on stdin.
+
+          MemorySpy.Collector analyze --capture <path> [--max-types <n>]
+              Resolve allocation call sites from a capture file produced outside a session —
+              the .nettrace a pre-.NET 10 target writes when it is started with EventPipe
+              armed (flushed when the process exits). The config that answers:
+              DOTNET_EventPipeConfig=Microsoft-Windows-DotNETRuntime:0x3200001:5
+              (sampled allocations + stacks + the GC events; see ARCHITECTURE.md for the
+              startup-arming recipe and its one gap — the type leaderboard, which startup
+              captures cannot fill because the runtime writes no BulkType events for them).
 
         Watch options:
           --probes <a,b,c>     Probes to enable (default: all). See 'capabilities'.

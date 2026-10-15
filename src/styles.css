@@ -42,6 +42,12 @@
   --rail-width: 322px;
   --spine-width: 152px;
 
+  /* Scrollbars: quiet graphite, one step lighter under the pointer. Deliberately not the accent —
+     amber is spoken for by the heap growth rate, and a scrollbar is not a measurement. */
+  --scrollbar-thumb: #2c3a40;
+  --scrollbar-thumb-hover: #3a4b52;
+  --scrollbar-thumb-active: #465a62;
+
   color-scheme: dark;
 }
 
@@ -86,6 +92,63 @@ textarea {
     transition: none !important;
     animation: none !important;
   }
+}
+
+/* ---------------------------------------------------------------------------------------
+   Scrollbars
+   --------------------------------------------------------------------------------------- */
+
+/*
+ * The platform scrollbar is the one piece of chrome this app does not draw, and on Windows it
+ * arrives as a light grey slab with stepper arrows — a different application sitting inside this
+ * one. It is replaced with a thin rail in the same graphite as the surfaces: no arrows, no track
+ * fill, and a thumb that only lifts to a lighter grey under the pointer.
+ *
+ * Both syntaxes are set because the app runs in three webviews: the `::-webkit-scrollbar` family
+ * covers WebView2 (Windows) and WKWebView (macOS), and the standard `scrollbar-*` properties cover
+ * the newer Chromium path and every engine that ignores the pseudo-elements. `color-scheme: dark`
+ * above is the fallback for the platforms that honour neither.
+ */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  /* A transparent border plus `background-clip: content-box` is what makes the thumb read as a
+     floating pill rather than a slab filling the whole gutter. */
+  background: var(--scrollbar-thumb);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--scrollbar-thumb-active);
+  background-clip: content-box;
+}
+
+/* The two panes that are always on screen reserve their gutter, so switching to a tab whose
+   content does not scroll never shifts every line sideways by the width of a scrollbar. */
+.main-scroll,
+.rail {
+  scrollbar-gutter: stable;
 }
 
 /* ---------------------------------------------------------------------------------------

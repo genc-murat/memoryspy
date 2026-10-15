@@ -30,12 +30,14 @@ namespace MemorySpy.Collector.Probes;
 /// <list type="bullet">
 /// <item>The older <c>GCSampledObjectAllocation</c> mechanism
 /// (<c>GCAllObjectAllocation</c> = <c>0x2200000</c>, the one PerfView-era tooling uses)
-/// produces <em>nothing at all</em> on .NET 10, but it is the <em>only</em> mechanism on
-/// older runtimes: a real capture from a .NET 7.0.3 process holds 16 443 allocation ticks
-/// and not one sampled allocation, because a runtime silently ignores a keyword bit it has
-/// never heard of. So the probe requests <em>both</em> keywords — each one is inert exactly
-/// where the other works, and the analysis reads whichever event the runtime actually
-/// produced.</item>
+/// cannot be armed by attaching: runtimes before 10 install the allocation sampler only
+/// while the process is starting, so an attached session requests the keywords, the runtime
+/// accepts the session, and no sample is ever taken. Measured on .NET 7.0.3 with the legacy
+/// keywords requested: 4 355 allocation ticks and not one sampled allocation; a session
+/// asking for <em>only</em> those keywords delivers no bytes at all, because no event is
+/// ever emitted to flush the stream header. The probe still requests the keyword — it costs
+/// nothing, and it is the right ask for a capture whose target was started with tracing
+/// armed — but on an attached session only the modern keyword, from .NET 10, can answer.</item>
 /// <item>TraceEvent cannot resolve a call stack on a live <c>EventPipeEventSource</c> — it
 /// throws "Attempted to use TraceLog support on a non-TraceLog TraceEventSource" — because
 /// instruction pointers can only be turned into method names once the module and method maps
@@ -84,10 +86,11 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     /// <summary>
     /// <c>ClrTraceEventParser.Keywords.GCAllObjectAllocation</c>, likewise verified against
     /// TraceEvent 4.0.0's enum: the sampled-allocation mechanism of .NET Core 3+ before 10.
-    /// Requested alongside the modern keyword because a runtime ignores what it does not
-    /// know — the measured proof is a .NET 7.0.3 capture taken with only the modern bit
-    /// armed: 16 443 allocation ticks, zero sampled allocations. On .NET 10 this legacy bit
-    /// is the keyword that produces nothing, so requesting both is safe in both directions.
+    /// Attach cannot arm it — the sampler is installed only while the process is starting
+    /// (measured on 7.0.3: an attached session with this keyword requested produced ticks
+    /// but no samples) — so on an attached session this bit is inert. It is requested anyway:
+    /// it costs nothing, .NET 10 ignores it, and it is the correct ask for the one scenario
+    /// where it can work, a target that was started with tracing already armed.
     /// </summary>
     private const long KeywordGCAllObjectAllocation = 0x2200000;
 
@@ -236,7 +239,7 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
         ["notes"] = new[]
         {
             "Call stacks cannot be resolved on a live EventPipe stream, so this probe needs the raw stream written to a .nettrace and answers once the session stops.",
-            "Both sampled-allocation keywords are requested and the runtime keeps the one it knows: AllocationSampling on .NET 10 and later, GCAllObjectAllocation from .NET Core 3 through 9. A runtime silently ignores a keyword bit it has never heard of, which is why only one was not enough.",
+            "Attach-time sampling is a .NET 10 capability: the AllocationSampling keyword can be armed by attaching. The legacy keywords (before 10) only work when tracing is armed before the process starts, so on an older target an attached capture holds no samples and the analysis says so.",
             "Allocation events carry the managed call stack, resolved to method names, including frames inside the runtime — which is what makes framework types actionable.",
             "Source lines come from each module's PDB: the code address yields the method, and the PDB is read again to turn its IL offset into a file and line. PDBs are looked up next to the assemblies, and through _NT_SYMBOL_PATH when it is set (which is what enables a symbol server; nothing is downloaded otherwise).",
             "When a module's PDB cannot be found, its sites fall back to the method name and are counted in sitesWithoutSource, with the module reported in modulesWithoutSource.",
@@ -328,25 +331,47 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
     /// indistinguishable from "the feature is broken".
     ///
     /// The evidence is in the capture itself: allocation ticks that kept firing prove the
-    /// process was allocating and the session was live, so the empty result is the sampler
-    /// mechanism, not the target going quiet — and the rundown names the runtime that ignored
-    /// whichever keyword it did not know. Measured case in point: a .NET 7.0.3 capture armed
-    /// with only the modern keyword held 16 443 ticks and not one sampled allocation.
+    /// process was allocating and the session was live. On .NET 9 and older that combination
+    /// has one known cause, and it has to be named precisely, because no keyword choice on
+    /// our side can fix it: those runtimes install the allocation sampler only while the
+    /// process is starting, so a session attached later requests the keywords, the runtime
+    /// accepts the session, and the sampler is never installed. Measured on 7.0.3: 4 355
+    /// ticks and not one sampled allocation in a capture whose session requested the legacy
+    /// keywords — and a session requesting *only* those keywords never delivers a single
+    /// byte, because no event is ever emitted to flush the header. Attach-time sampling is
+    /// what the modern keyword added in .NET 10.
     /// </summary>
     private static void ReportZeroSamples(AnalysisResult result, ProbeContext context)
     {
-        var runtime = result.RuntimeVersion is { } version
-            ? $" The capture was written by runtime {version}."
+        var ticks = $"{result.AllocationTickEvents:N0} GC/AllocationTick events";
+
+        if (Version.TryParse(result.RuntimeVersion, out var version) && version.Major <= 9)
+        {
+            context.Log(
+                "The capture holds no sampled allocation events, so there are no call sites to " +
+                $"report — the target runs .NET {version}, where allocation sampling is installed only " +
+                "while the process is starting. A session attached later asks for the keywords and the " +
+                "runtime accepts it, but the sampler is never armed — the capture's " + ticks +
+                " show the process was allocating. Attach-time call sites need a .NET 10+ target; " +
+                "on this runtime the alternative is starting the process with tracing already armed " +
+                "(the runtime's DOTNET_EnableEventPipe environment variables), and analysing the " +
+                "file it writes.",
+                "warn");
+            return;
+        }
+
+        var runtime = result.RuntimeVersion is { } named
+            ? $" The capture was written by runtime {named}."
             : string.Empty;
 
         context.Log(
-            "warn",
             "The capture holds no sampled allocation events, so there are no call sites to " +
-            $"report — it holds {result.AllocationTickEvents:N0} GC/AllocationTick events, so the " +
-            "process was allocating but the runtime produced no samples. Both sampled-allocation " +
-            "keywords were requested: AllocationSampling (.NET 10+) and GCAllObjectAllocation " +
-            "(.NET Core 3+ to 9), so an empty capture on this build means the runtime predates " +
-            "sampled allocations or has them disabled by configuration." + runtime);
+            "report — it holds " + ticks + ", so the process was allocating but the runtime " +
+            "produced no samples. Both sampled-allocation keywords were requested: " +
+            "AllocationSampling (.NET 10+) and the startup-time legacy keywords, so an empty " +
+            "capture on this build means the runtime has sampling disabled by configuration." +
+            runtime,
+            "warn");
     }
 
     /// <summary>
@@ -379,6 +404,12 @@ public sealed class AllocationSiteProbe : ICollectorProbe, IRawCaptureConsumer
                 "_NT_SYMBOL_PATH at a server that answers, or unset it to keep the lookup local.",
                 "warn");
         }
+
+        // With no sites at all, the source-line story is moot: the zero-samples warning has
+        // already said everything there is to say, and a "no PDB found" line under it would
+        // point the user at symbols when the actual gap is that nothing was sampled.
+        if (total == 0)
+            return;
 
         if (withSource == 0 && resolver.StopReason is null)
         {

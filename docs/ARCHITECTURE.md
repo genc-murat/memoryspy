@@ -162,18 +162,20 @@ most in practice are framework types — `byte[]`, `string`, a dictionary's inte
 those there is no `new byte[]` to search for. Only a call stack helps, and getting one took
 four findings that are worth writing down because three of them contradict the obvious path:
 
-1. **Each runtime knows one allocation-sampling keyword.** The classic mechanism
-   (`GCAllObjectAllocation`, `0x2200000` — the keyword PerfView-era tooling uses) emits *nothing*
-   for a ten second capture on .NET 10. And the modern `AllocationSampling` keyword
-   (`0x80000000000`) emits nothing on the runtimes before it, because a runtime silently ignores
-   a keyword bit it has never heard of: a real capture from a .NET 7.0.3 service armed with only
-   the modern bit held **16 443 allocation ticks and zero sampled allocations** — a healthy,
-   allocating process, an empty answer. The probe therefore requests *both* keywords, each inert
-   exactly where the other works, and the analysis reads whichever event the capture actually
-   holds. The modern one emits hundreds of thousands of events per ten seconds, each carrying
-   the type, the object size and a full managed call stack; when a capture still comes back
-   empty, the probe says so against its own evidence (the tick count and the runtime version
-   from the rundown) rather than reporting a bare zero.
+1. **Attach-time sampling is what .NET 10 added.** The modern `AllocationSampling` keyword
+   (`0x80000000000`) emits hundreds of thousands of events per ten seconds on .NET 10, each
+   carrying the type, the object size and a full managed call stack — and, crucially, it can
+   be armed by attaching to a running process. The classic keywords (`GCSampledObjectAllocationHigh`
+   `0x200000` / `Low` `0x2000000`, composite `GCAllObjectAllocation` `0x2200000`) cannot:
+   runtimes before 10 install the allocation sampler only while the process is starting, so an
+   attached session requests the keywords, the runtime accepts it, and no sample is ever taken.
+   Measured against a live .NET 7.0.3 process: a session with the legacy keywords requested
+   collected **4 355 allocation ticks and zero sampled allocations**, and a session asking for
+   *only* those keywords never delivered a byte — no event ever fires, so even the stream
+   header is never flushed. The probe still requests both keywords (the legacy bit is free,
+   ignored by 10, and correct for a target started with tracing armed), and the analysis names
+   the runtime version when it has to report an empty capture, so "your target predates
+   attachable sampling" is a sentence the user reads rather than a zero they stare at.
 2. **A live stack cannot be named.** `TraceEvent.CallStack()` throws on an
    `EventPipeEventSource` — *"Attempted to use TraceLog support on a non-TraceLog
    TraceEventSource"* — because an instruction pointer becomes a method name only after the

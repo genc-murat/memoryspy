@@ -237,7 +237,9 @@ public sealed class CollectorSession : IDisposable
     /// <summary>Signals the parsing thread to unwind once the stream ends.</summary>
     public void RequestStop()
     {
-        if (_capture is not null)
+        // Idempotent for the *log*: a cap-driven stop landing while the user's stop is already
+        // draining prints the explanation twice, which reads as two stops having happened.
+        if (Interlocked.Exchange(ref _stopRequestedLogged, 1) == 0 && _capture is not null)
         {
             // The stop of a deep capture has quiet phases the host deliberately waits through —
             // draining the rundown the runtime still owes the session, closing the file,
@@ -261,6 +263,8 @@ public sealed class CollectorSession : IDisposable
             // Ignore: we are already shutting down.
         }
     }
+
+    private int _stopRequestedLogged;
 
     private void OnDynamicEvent(TraceEvent ev)
     {

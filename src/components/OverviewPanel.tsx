@@ -124,6 +124,7 @@ export function OverviewPanel({ store, showAllCounters, replaying = false, onOpe
         </header>
         <TimeSeriesChart
           height={240}
+          stepBase="binary"
           format={(value) => formatBytesCompact(value)}
           series={[
             {
@@ -156,6 +157,7 @@ export function OverviewPanel({ store, showAllCounters, replaying = false, onOpe
         </header>
         <TimeSeriesChart
           height={220}
+          stepBase="binary"
           format={(value) => formatBytesCompact(value)}
           series={[
             { key: 'gen2', label: 'Gen 2', color: palette.gen2, points: store.counter('gen-2-size')?.points ?? [] },
@@ -216,6 +218,7 @@ export function OverviewPanel({ store, showAllCounters, replaying = false, onOpe
             <p className="focused-desc">{store.counter(selected)?.meta.description}</p>
             <TimeSeriesChart
               height={200}
+              stepBase={store.counter(selected!)?.meta.unit === 'bytes' ? 'binary' : 'decimal'}
               format={(value) =>
                 store.counter(selected!)?.meta.unit === 'percent'
                   ? `${value.toFixed(1)}%`

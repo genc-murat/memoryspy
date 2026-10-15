@@ -93,7 +93,12 @@ export function GcPanel({ store }: Props) {
             estimates. A sawtooth in Gen 0 with a flat Gen 2 is healthy; a rising Gen 2 floor is not.
           </p>
         </header>
-        <TimeSeriesChart height={240} format={(value) => formatBytesCompact(value)} series={heapSeries} />
+        <TimeSeriesChart
+          height={240}
+          stepBase="binary"
+          format={(value) => formatBytesCompact(value)}
+          series={heapSeries}
+        />
       </section>
 
       <div className="two-col">

@@ -185,6 +185,10 @@ code {
   text-align: right;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  /* A value and its unit are one token. Breaking between them turned "1.18 MB/s" into a value
+     sitting above its own unit in some rows and not others, which made a numeric column read
+     like two different columns. */
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------------------------------
@@ -684,15 +688,28 @@ code {
 .tabs {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 1px;
   padding: 0 14px;
   background: var(--ink-850);
   border-bottom: 1px solid var(--line);
   min-height: 36px;
+  /* One row, always. Wrapping gave "Call Sites" and "Heap Snapshot" a second line, so the strip
+     mixed 35 px and 51 px tabs and the active underline sat at two different heights. Past the
+     available width the strip scrolls sideways instead; the rail is hidden because a 2 px bar
+     under the tabs is louder than the tabs themselves. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .tab {
-  padding: 8px 12px;
+  /* 9px, not 12: at a 1280-wide window the nine tabs then fit without the strip having to
+     scroll, so the last one is not the one that loses. Narrower windows still scroll. */
+  padding: 8px 9px;
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -701,6 +718,8 @@ code {
   letter-spacing: 0.02em;
   color: var(--text-dim);
   cursor: pointer;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .tab:hover:not(.is-unavailable) {
@@ -729,6 +748,10 @@ code {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 44%;
+  /* The hint yields before the tabs do, so it is the meta line and not a tab that loses the
+     squeezing contest when the strip is tight. */
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .main-scroll {
@@ -1354,7 +1377,9 @@ code {
 
 .gc-row {
   display: grid;
-  grid-template-columns: 62px 44px 1fr 62px minmax(90px, 150px);
+  /* 78 px, not 62: a locale-rendered clock ("07:57:25 PM") broke after the seconds and put the
+     meridiem on its own line, which doubled the height of every row in the list. */
+  grid-template-columns: 78px 44px 1fr 62px minmax(90px, 150px);
   align-items: center;
   gap: 8px;
   padding: 4px 0;
@@ -1365,6 +1390,7 @@ code {
 
 .gc-time {
   color: var(--text-faint);
+  white-space: nowrap;
 }
 
 .gc-gen {
@@ -1779,6 +1805,23 @@ code {
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * The bar is scaled against the largest heap seen in the window, not against 100%, so its height
+ * means nothing on its own. The scale is therefore stated above it and the zero baseline is drawn
+ * as a real edge: without both, the block is a coloured area a reader has to guess the size of.
+ */
+.spine-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: -6px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
 .spine-bar {
   display: flex;
   flex-direction: column-reverse;
@@ -1786,6 +1829,7 @@ code {
   height: 240px;
   background: linear-gradient(180deg, transparent, rgba(122, 150, 160, 0.06));
   border: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line);
   border-radius: var(--radius);
   overflow: hidden;
 }
@@ -1844,6 +1888,8 @@ code {
   font-size: 10px;
 }
 
+
+
 .legend-swatch {
   width: 8px;
   height: 8px;
@@ -1852,11 +1898,24 @@ code {
 
 .legend-label {
   color: var(--text-dim);
+  /* The label column is the one that yields, but a name must never break across two lines. */
+  white-space: nowrap;
 }
 
 .legend-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
+  /* "374.2 MB" is one token; a flex item wraps its own text at the space otherwise. */
+  white-space: nowrap;
+}
+
+/* Share of the heap, so the bar's largest band is quantified rather than merely large. */
+.legend-share {
+  color: var(--text-faint);
+  opacity: 0.7;
 }
 
 /* ---------------------------------------------------------------------------------------

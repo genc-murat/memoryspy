@@ -1,4 +1,4 @@
-import { formatBytes } from '../lib/format';
+import { formatBytes, formatPercent } from '../lib/format';
 import { heapColors, heapLabels } from '../lib/palette';
 import type { HeapSnapshotPoint } from '../lib/store';
 
@@ -44,6 +44,17 @@ export function Spine({ heap, growthPerMinute, confidence, history }: Props) {
         <span className="spine-total">{heap ? formatBytes(total) : '—'}</span>
       </div>
 
+      {/*
+       * The bar is measured against the peak, not against 100%, so the scale is named here. An
+       * unlabelled block of colour is a shape a reader can only guess the size of.
+       */}
+      <div className="spine-scale">
+        <span className="spine-scale-peak">peak {heap ? formatBytes(peak) : '—'}</span>
+        <span className="spine-scale-now">
+          {heap && peak > 0 && total > 0 ? `${Math.round((total / peak) * 100)}% of peak` : '—'}
+        </span>
+      </div>
+
       <div className="spine-bar" role="img" aria-label="Managed heap composition by generation">
         {segments.map((segment) => {
           const heightPercent = peak > 0 ? (segment.bytes / peak) * 100 : 0;
@@ -83,7 +94,14 @@ export function Spine({ heap, growthPerMinute, confidence, history }: Props) {
             <li key={segment.key}>
               <span className="legend-swatch" style={{ background: segment.color }} />
               <span className="legend-label">{segment.label}</span>
-              <span className="legend-value">{heap ? formatBytes(segment.bytes) : '—'}</span>
+              {/* The share rides inside the value cell: a fourth grid column squeezed the label
+                  ("Gen 2" broke across two lines), and the row has no width to spare. */}
+              <span className="legend-value">
+                {heap && total > 0 && segment.bytes > 0 && (
+                  <span className="legend-share">{formatPercent((segment.bytes / total) * 100, 1)}</span>
+                )}
+                {heap ? formatBytes(segment.bytes) : '—'}
+              </span>
             </li>
           ))}
       </ul>

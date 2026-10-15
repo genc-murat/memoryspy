@@ -20,6 +20,12 @@ interface Props {
   format: (value: number) => string;
   /** Force the y axis to start at zero, which is almost always right for memory. */
   zeroBased?: boolean;
+  /**
+   * Which number system the ticks should be round in. Byte charts are formatted in binary units
+   * (KiB/MiB/GiB), so they need `binary`; anything measured in milliseconds, counts or percent
+   * wants the decimal ladder.
+   */
+  stepBase?: StepBase;
   emptyMessage?: string;
 }
 
@@ -31,6 +37,67 @@ interface HoverState {
   at: number;
 }
 
+interface Domain {
+  min: number;
+  max: number;
+  step: number;
+}
+
+/** The number system the tick step should be round in. See {@link niceStep}. */
+export type StepBase = 'decimal' | 'binary';
+
+/**
+ * A step that is round in the units the axis actually prints.
+ *
+ * `decimal` gives 1, 2, 2.5 or 5 times a power of ten. `binary` gives 1, 2, 4 or 8 times a power
+ * of two, because a byte axis is labelled in KiB/MiB/GiB: a decimal step of 50 000 000 bytes is
+ * drawn as `47.7M`, so a perfectly even ladder reads as arbitrary digits. Matching the step to the
+ * units is what makes the labels recognisable.
+ */
+function niceStep(rawStep: number, base: StepBase): number {
+  const safe = rawStep > 0 ? rawStep : 1;
+
+  if (base === 'binary') {
+    const power = 2 ** Math.floor(Math.log2(safe));
+    for (const multiple of [1, 2, 4, 8]) {
+      const candidate = multiple * power;
+      if (candidate >= safe) return candidate;
+    }
+    return 16 * power;
+  }
+
+  const magnitude = 10 ** Math.floor(Math.log10(safe));
+  const normalized = safe / magnitude;
+  return (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10) * magnitude;
+}
+
+/**
+ * A tick ladder of round numbers.
+ *
+ * A chart is read by comparing the newest point against a labelled gridline, so the labels have to
+ * be numbers a reader recognises — 1, 2, 2.5 or 5 times a power of ten. Dividing the data range
+ * into equal parts instead yields labels like `208M / 415M / 623M`, which have to be read digit by
+ * digit, and it lets a floor that is not zero through. That is exactly how a byte axis ended up
+ * labelled `−76 B`: a noisy Gen 0 counter dipping a few bytes below zero dragged the floor with it.
+ *
+ * So a zero-based chart — which is what every memory series in this app is — pins the floor at
+ * exactly zero, and the top is rounded up to the next step so the newest point never touches the
+ * frame. A chart that genuinely straddles zero (`zeroBased: false`) keeps a floor below zero and
+ * rounds it down to a step instead.
+ */
+function niceDomain(min: number, max: number, targetTicks: number, zeroBased: boolean, stepBase: StepBase): Domain {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1, step: 0.25 };
+  if (max <= min) max = min + 1;
+
+  const step = niceStep((max - min) / targetTicks, stepBase);
+
+  const floor = zeroBased ? 0 : Math.floor(min / step) * step;
+  let ceiling = Math.ceil(max / step) * step;
+  if (ceiling <= max) ceiling += step;
+
+  return { min: floor, max: ceiling, step };
+}
+
 /**
  * A canvas time series chart.
  *
@@ -38,7 +105,14 @@ interface HoverState {
  * target process is under load; hundreds of DOM nodes per chart would be the first thing to
  * stutter. The component owns its own drawing and only re-renders on a data version bump.
  */
-export function TimeSeriesChart({ series, height = 220, format, zeroBased = true, emptyMessage }: Props) {
+export function TimeSeriesChart({
+  series,
+  height = 220,
+  format,
+  zeroBased = true,
+  stepBase = 'decimal',
+  emptyMessage,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [hover, setHover] = useState<HoverState | null>(null);
@@ -109,22 +183,20 @@ export function TimeSeriesChart({ series, height = 220, format, zeroBased = true
       }
     }
 
-    if (zeroBased) minY = Math.min(0, minY);
+    // A flat series, or a single sample, would divide by zero on the y scale.
     if (maxY === minY) maxY = minY + 1;
 
-    // Pad the top by 8% so the newest point is never glued to the frame.
-    const range = maxY - minY;
-    maxY += range * 0.08;
+    const domain = niceDomain(minY, maxY, 4, zeroBased, stepBase);
     const spanX = Math.max(1, maxX - minX);
 
     const scaleX = (t: number) => padding.left + ((t - minX) / spanX) * plotWidth;
-    const scaleY = (v: number) => padding.top + plotHeight - ((v - minY) / (maxY - minY)) * plotHeight;
+    const scaleY = (v: number) => padding.top + plotHeight - ((v - domain.min) / (domain.max - domain.min)) * plotHeight;
 
     // ---- Grid and axis labels -------------------------------------------------------
-    const ticks = 4;
+    const ticks = Math.max(1, Math.round((domain.max - domain.min) / domain.step));
     ctx.textAlign = 'right';
     for (let i = 0; i <= ticks; i += 1) {
-      const value = minY + ((maxY - minY) * i) / ticks;
+      const value = domain.min + i * domain.step;
       const y = scaleY(value);
 
       ctx.strokeStyle = 'rgba(120, 140, 150, 0.13)';
@@ -148,9 +220,9 @@ export function TimeSeriesChart({ series, height = 220, format, zeroBased = true
         gradient.addColorStop(1, `${s.color}05`);
 
         ctx.beginPath();
-        ctx.moveTo(scaleX(points[0].t), scaleY(minY));
+        ctx.moveTo(scaleX(points[0].t), scaleY(domain.min));
         for (const point of points) ctx.lineTo(scaleX(point.t), scaleY(point.v));
-        ctx.lineTo(scaleX(points[points.length - 1].t), scaleY(minY));
+        ctx.lineTo(scaleX(points[points.length - 1].t), scaleY(domain.min));
         ctx.closePath();
         ctx.fillStyle = gradient;
         ctx.fill();
@@ -198,7 +270,7 @@ export function TimeSeriesChart({ series, height = 220, format, zeroBased = true
         ctx.stroke();
       }
     }
-  }, [size, series, format, zeroBased, hover, emptyMessage, drawnSeries]);
+  }, [size, series, format, zeroBased, stepBase, hover, emptyMessage, drawnSeries]);
 
   useEffect(() => {
     draw();

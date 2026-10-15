@@ -210,6 +210,33 @@ pub fn locate_collector() -> CollectorLocation {
     }
 }
 
+/// Stops Windows from giving a child process a console window of its own.
+///
+/// The app is a GUI: `main.rs` sets `windows_subsystem = "windows"` for release builds, so it has
+/// no console to pass down. Every `dotnet` child it starts is a *console* application, and Windows
+/// responds by allocating a fresh console for it — a black window that flashes on each rescan and,
+/// for the long-lived `watch` session, stays on screen for as long as the app is attached.
+/// `CREATE_NO_WINDOW` tells the loader to run the child without one. Nothing is lost by it: stdout
+/// and stderr are pipes here, not the console, and it is equally harmless for the short-lived
+/// lookups (`where`, `dotnet --version`).
+///
+/// Deliberately not `CREATE_NEW_PROCESS_GROUP` or `DETACHED_PROCESS`: the session is stopped by
+/// writing to its stdin and killing it if it does not comply, which needs an ordinary child, not a
+/// detached one. A no-op off Windows.
+fn without_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        /// `CREATE_NO_WINDOW` from `winbase.h`: run the process without inheriting or allocating a
+        /// console.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
 fn find_dotnet() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("MEMORYSPY_DOTNET") {
         let path = PathBuf::from(explicit);
@@ -229,7 +256,10 @@ fn find_dotnet() -> Option<PathBuf> {
     }
 
     let lookup = if cfg!(windows) { "where" } else { "which" };
-    let output = Command::new(lookup).arg(exe).output().ok()?;
+    let mut command = Command::new(lookup);
+    command.arg(exe);
+    without_console_window(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -244,7 +274,10 @@ fn find_dotnet() -> Option<PathBuf> {
 }
 
 fn probe_dotnet_version(dotnet: &Path) -> Option<String> {
-    let output = Command::new(dotnet).arg("--version").output().ok()?;
+    let mut command = Command::new(dotnet);
+    command.arg("--version");
+    without_console_window(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -288,6 +321,7 @@ pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<Do
     if fast {
         command.arg("--fast");
     }
+    without_console_window(&mut command);
 
     let output = command
         .output()
@@ -324,11 +358,15 @@ pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<Do
 pub fn fetch_capabilities(location: &CollectorLocation) -> Result<serde_json::Value, String> {
     let (dotnet, assembly) = resolve_or_err(location)?;
 
-    let output = Command::new(dotnet)
+    let mut command = Command::new(dotnet);
+    command
         .arg(assembly)
         .arg("capabilities")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    without_console_window(&mut command);
+
+    let output = command
         .output()
         .map_err(|e| format!("Failed to run the collector: {e}"))?;
 
@@ -700,6 +738,8 @@ pub fn start_session(
     if let Some(path) = &capture_path {
         command.arg("--capture").arg(path);
     }
+
+    without_console_window(&mut command);
 
     let mut child = command
         .stdin(Stdio::piped())

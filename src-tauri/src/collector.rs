@@ -1,0 +1,934 @@
+//! Host-side supervision of the MemorySpy.Collector sidecar.
+//!
+//! The collector is a separate .NET process, so this module owns three concerns:
+//! *finding* it (it ships as build output, not as a linked library), *running* it, and
+//! *streaming* its newline delimited JSON to the frontend without blocking the UI thread
+//! or flooding the IPC channel.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
+
+use crate::recording::{RecordingSummary, RecordingTarget, RecordingWriter};
+
+/// Event names the frontend subscribes to. Kept in one place so the TypeScript side and
+/// the Rust side cannot drift apart silently.
+pub const EVENT_MESSAGES: &str = "memoryspy://messages";
+pub const EVENT_LOG: &str = "memoryspy://log";
+pub const EVENT_STATUS: &str = "memoryspy://status";
+
+/// Where a session sends what it learns.
+///
+/// This trait exists so the supervision logic does not depend on Tauri. The desktop app
+/// supplies [`TauriSink`], which forwards to the webview; tests supply a recorder, which is
+/// how the host/collector contract is verified against a real .NET process without a GUI.
+pub trait EventSink: Send + Sync + 'static {
+    fn messages(&self, session_id: &str, messages: Vec<serde_json::Value>);
+    fn log(&self, session_id: &str, level: &str, message: &str);
+    fn status(
+        &self,
+        session_id: &str,
+        pid: i32,
+        state: SessionState,
+        detail: Option<String>,
+        stats: serde_json::Value,
+    );
+
+    /// Reports the state of a replay. Defaulted to a no-op because only the desktop sink has
+    /// a channel to send it on, and a replay is the one thing a test sink never needs.
+    fn playback(&self, _payload: serde_json::Value) {}
+}
+
+/// The production sink: emits Tauri events the React app listens for.
+pub struct TauriSink {
+    app: AppHandle,
+}
+
+impl TauriSink {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl EventSink for TauriSink {
+    fn messages(&self, session_id: &str, messages: Vec<serde_json::Value>) {
+        if messages.is_empty() {
+            return;
+        }
+
+        let _ = self.app.emit(
+            EVENT_MESSAGES,
+            serde_json::json!({ "sessionId": session_id, "messages": messages }),
+        );
+    }
+
+    fn log(&self, session_id: &str, level: &str, message: &str) {
+        let _ = self.app.emit(
+            EVENT_LOG,
+            serde_json::json!({ "sessionId": session_id, "level": level, "message": message }),
+        );
+    }
+
+    fn status(
+        &self,
+        session_id: &str,
+        pid: i32,
+        state: SessionState,
+        detail: Option<String>,
+        stats: serde_json::Value,
+    ) {
+        let _ = self.app.emit(
+            EVENT_STATUS,
+            serde_json::json!({
+                "sessionId": session_id,
+                "pid": pid,
+                "state": state,
+                "detail": detail,
+                "stats": stats,
+            }),
+        );
+    }
+
+    fn playback(&self, payload: serde_json::Value) {
+        let _ = self.app.emit(crate::recording::EVENT_PLAYBACK, payload);
+    }
+}
+
+/// Name of the collector assembly inside the build output / bundled resources.
+const COLLECTOR_ASSEMBLY: &str = "MemorySpy.Collector.dll";
+
+/// How long to wait for a graceful stop before killing the child process.
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Maximum number of messages buffered before flushing to the frontend.
+const MESSAGE_BATCH_SIZE: usize = 64;
+
+/// Maximum time a message waits in the buffer before being flushed.
+const MESSAGE_BATCH_INTERVAL: Duration = Duration::from_millis(80);
+
+// ---------------------------------------------------------------------------------------
+// Locating the collector
+// ---------------------------------------------------------------------------------------
+
+/// Where the collector was found, plus everything the UI needs to explain a failure.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectorLocation {
+    pub found: bool,
+    /// Path to the `dotnet` host executable.
+    pub dotnet_path: Option<String>,
+    /// Path to MemorySpy.Collector.dll.
+    pub assembly_path: Option<String>,
+    /// How the path was resolved: env | resource | build-output | missing.
+    pub source: String,
+    pub dotnet_version: Option<String>,
+    pub searched: Vec<String>,
+    pub error: Option<String>,
+}
+
+pub fn locate_collector() -> CollectorLocation {
+    let mut searched = Vec::new();
+
+    let dotnet = find_dotnet();
+    let dotnet_version = dotnet.as_deref().and_then(probe_dotnet_version);
+
+    // 1. Explicit override, for pointing the app at a custom build.
+    if let Ok(explicit) = std::env::var("MEMORYSPY_COLLECTOR") {
+        let path = PathBuf::from(&explicit);
+        searched.push(explicit.clone());
+        if path.is_file() {
+            return CollectorLocation {
+                found: true,
+                dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
+                assembly_path: Some(path.to_string_lossy().into_owned()),
+                source: "env".into(),
+                dotnet_version,
+                searched,
+                error: None,
+            };
+        }
+    }
+
+    let mut candidates: Vec<(PathBuf, &str)> = Vec::new();
+
+    // 2. Bundled resource directory, used by a packaged build.
+    if let Ok(resource_dir) = std::env::var("MEMORYSPY_RESOURCE_DIR") {
+        candidates.push((PathBuf::from(resource_dir).join("collector"), "resource"));
+    }
+
+    // 3. Development build output relative to the crate, so `npm run tauri dev` just works
+    //    after `npm run collector:build`.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().map(Path::to_path_buf).unwrap_or(manifest_dir);
+    for config in ["Debug", "Release"] {
+        candidates.push((
+            repo_root.join("collector").join("bin").join(config).join("net10.0"),
+            "build-output",
+        ));
+    }
+
+    // 4. A published collector staged for packaging.
+    candidates.push((repo_root.join("src-tauri").join("resources").join("collector"), "resource"));
+
+    for (dir, source) in candidates {
+        let candidate = dir.join(COLLECTOR_ASSEMBLY);
+        searched.push(candidate.to_string_lossy().into_owned());
+        if candidate.is_file() {
+            return CollectorLocation {
+                found: true,
+                dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
+                assembly_path: Some(candidate.to_string_lossy().into_owned()),
+                source: source.into(),
+                dotnet_version,
+                searched,
+                error: None,
+            };
+        }
+    }
+
+    CollectorLocation {
+        found: false,
+        dotnet_path: dotnet.map(|p| p.to_string_lossy().into_owned()),
+        assembly_path: None,
+        source: "missing".into(),
+        dotnet_version,
+        searched,
+        error: Some(format!(
+            "Could not find {COLLECTOR_ASSEMBLY}. Build it with `npm run collector:build`, \
+             or set MEMORYSPY_COLLECTOR to its full path."
+        )),
+    }
+}
+
+fn find_dotnet() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("MEMORYSPY_DOTNET") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let exe = if cfg!(windows) { "dotnet.exe" } else { "dotnet" };
+
+    // DOTNET_ROOT is the conventional install location for a private .NET runtime.
+    if let Ok(root) = std::env::var("DOTNET_ROOT") {
+        let candidate = PathBuf::from(root).join(exe);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let lookup = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(lookup).arg(exe).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?.trim();
+    if first.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(first))
+    }
+}
+
+fn probe_dotnet_version(dotnet: &Path) -> Option<String> {
+    let output = Command::new(dotnet).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// ---------------------------------------------------------------------------------------
+// Process list
+// ---------------------------------------------------------------------------------------
+
+/// A .NET process the user can attach to. Mirrors `DotnetProcessInfo` in the collector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DotnetProcessInfo {
+    pub pid: i32,
+    pub name: String,
+    pub command_line: Option<String>,
+    pub executable_path: Option<String>,
+    pub runtime_version: Option<String>,
+    pub runtime_directory: Option<String>,
+    pub working_set_bytes: Option<i64>,
+    pub private_bytes: Option<i64>,
+    pub start_time_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessListData {
+    processes: Vec<DotnetProcessInfo>,
+}
+
+/// Runs the collector in its one-shot `list` mode and returns the parsed result.
+pub fn list_processes(location: &CollectorLocation, fast: bool) -> Result<Vec<DotnetProcessInfo>, String> {
+    let (dotnet, assembly) = resolve_or_err(location)?;
+
+    let mut command = Command::new(dotnet);
+    command
+        .arg(assembly)
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if fast {
+        command.arg("--fast");
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("Failed to run the collector: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The collector emits the envelope on stdout; the first well formed line is the answer.
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("type").and_then(|t| t.as_str()) == Some("process.list") {
+                if let Some(data) = value.get("data") {
+                    let parsed: ProcessListData = serde_json::from_value(data.clone())
+                        .map_err(|e| format!("Collector returned an unexpected process list: {e}"))?;
+                    return Ok(parsed.processes);
+                }
+            }
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "The collector did not return a process list. {}",
+        if stderr.trim().is_empty() { "No error output was produced.".to_string() } else { stderr.trim().to_string() }
+    ))
+}
+
+/// Runs the collector's `capabilities` command so the UI can build panels dynamically.
+pub fn fetch_capabilities(location: &CollectorLocation) -> Result<serde_json::Value, String> {
+    let (dotnet, assembly) = resolve_or_err(location)?;
+
+    let output = Command::new(dotnet)
+        .arg(assembly)
+        .arg("capabilities")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run the collector: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("type").and_then(|t| t.as_str()) == Some("hello") {
+                return Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null));
+            }
+        }
+    }
+
+    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+}
+
+fn resolve_or_err(location: &CollectorLocation) -> Result<(String, String), String> {
+    match (&location.dotnet_path, &location.assembly_path) {
+        (Some(dotnet), Some(assembly)) => Ok((dotnet.clone(), assembly.clone())),
+        _ => Err(location
+            .error
+            .clone()
+            .unwrap_or_else(|| "The collector is not available.".to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Live sessions
+// ---------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionState {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+/// Live counters shown in the status bar without having to inspect the event stream.
+#[derive(Debug, Default)]
+pub struct SessionStats {
+    pub messages: AtomicU64,
+    pub dropped: AtomicU64,
+    pub counters: AtomicU64,
+    pub allocation_samples: AtomicU64,
+    pub gc_events: AtomicU64,
+}
+
+struct SessionInner {
+    sink: Arc<dyn EventSink>,
+    id: String,
+    pid: i32,
+    state: Mutex<SessionState>,
+    // The child handle is shared with the stop and reader threads, so it needs its own
+    // `Arc` on top of the `Mutex`: the session itself is cloned into those threads.
+    child: Arc<Mutex<Option<Child>>>,
+    stdin: Mutex<Option<ChildStdin>>,
+    stop_requested: AtomicBool,
+    stats: SessionStats,
+    started_at_unix_ms: u64,
+    message_counts: Mutex<HashMap<String, u64>>,
+    /// Present while this session is being written to disk. Shared rather than owned so the
+    /// stdout and stderr pumps can both append to one file.
+    recorder: Mutex<Option<Arc<RecordingWriter>>>,
+}
+
+impl SessionInner {
+    fn set_state(&self, state: SessionState, detail: Option<String>) {
+        {
+            let mut guard = self.state.lock().unwrap();
+            *guard = state;
+        }
+
+        self.sink
+            .status(&self.id, self.pid, state, detail, self.stats_snapshot());
+    }
+
+    /// The active recorder, if this session is being written to disk.
+    fn recorder(&self) -> Option<Arc<RecordingWriter>> {
+        self.recorder
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn stats_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "messages": self.stats.messages.load(Ordering::Relaxed),
+            "dropped": self.stats.dropped.load(Ordering::Relaxed),
+            "counters": self.stats.counters.load(Ordering::Relaxed),
+            "allocationSamples": self.stats.allocation_samples.load(Ordering::Relaxed),
+            "gcEvents": self.stats.gc_events.load(Ordering::Relaxed),
+            "uptimeMs": now_unix_ms().saturating_sub(self.started_at_unix_ms),
+            "messageCounts": self.message_counts.lock().ok().map(|m| m.clone()).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionHandle(Arc<SessionInner>);
+
+impl SessionHandle {
+    pub fn id(&self) -> &str {
+        &self.0.id
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.0.pid
+    }
+
+    pub fn state(&self) -> SessionState {
+        *self.0.state.lock().unwrap()
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": self.0.id,
+            "pid": self.0.pid,
+            "state": self.state(),
+            "stats": self.0.stats_snapshot(),
+            "recording": self.0.recorder().map(|recorder| recorder.summary()),
+        })
+    }
+
+    /// The recording in progress, if any.
+    pub fn recording(&self) -> Option<RecordingSummary> {
+        self.0.recorder().map(|recorder| recorder.summary())
+    }
+
+    /// Starts recording a session that is already running.
+    ///
+    /// Attaching with a recording pre-armed is the common case, but the more useful one is
+    /// noticing the leak first and then deciding to keep the evidence.
+    pub fn start_recording(
+        &self,
+        target_name: Option<String>,
+        target_runtime: Option<String>,
+        path: Option<String>,
+        recordings_dir: Option<PathBuf>,
+    ) -> Result<RecordingSummary, String> {
+        let mut guard = self
+            .0
+            .recorder
+            .lock()
+            .map_err(|_| "The recording state is unavailable.".to_string())?;
+
+        if let Some(existing) = guard.as_ref() {
+            return Err(format!(
+                "Already recording to {}.",
+                existing.path().display()
+            ));
+        }
+
+        let request = SessionRequest {
+            pid: self.0.pid,
+            probes: Vec::new(),
+            interval_ms: None,
+            max_types: None,
+            verbose: false,
+            // A mid-session recording keeps the live stream; call sites need a capture that was
+            // armed before the stream started, so it cannot be bolted onto a running session.
+            deep_capture: false,
+            record: true,
+            record_path: path,
+            target_name,
+            target_runtime,
+        };
+
+        // Flagged as mid-session so no reader mistakes the first message for the start of the
+        // process's life.
+        let writer = open_recording(&request, recordings_dir.as_deref(), true)?;
+        let summary = writer.summary();
+        *guard = Some(writer);
+
+        Ok(summary)
+    }
+
+    /// Finishes the recording in progress. Returns `None` when nothing was being recorded.
+    pub fn stop_recording(&self) -> Result<Option<RecordingSummary>, String> {
+        let writer = {
+            let mut guard = self
+                .0
+                .recorder
+                .lock()
+                .map_err(|_| "The recording state is unavailable.".to_string())?;
+            guard.take()
+        };
+
+        match writer {
+            Some(writer) => {
+                writer.finish("recording-stopped", self.0.stats_snapshot());
+                Ok(Some(writer.summary()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Sends a command object to the collector's stdin.
+    pub fn send_command(&self, command: serde_json::Value) -> Result<(), String> {
+        let mut guard = self.0.stdin.lock().unwrap();
+        let stdin = guard.as_mut().ok_or_else(|| "The session has no open stdin.".to_string())?;
+
+        let line = serde_json::to_string(&command).map_err(|e| e.to_string())?;
+        writeln!(stdin, "{line}").map_err(|e| format!("Could not write to the collector: {e}"))?;
+        stdin.flush().map_err(|e| format!("Could not flush the collector command: {e}"))
+    }
+
+    /// Asks the collector to stop cleanly, then force kills it if it does not comply.
+    ///
+    /// The graceful path matters: it lets the collector detach its EventPipe session, which
+    /// leaves the target process in a clean state. The kill is the safety net for a target
+    /// that is wedged inside the runtime's tracing code.
+    pub fn stop(&self) {
+        self.0.stop_requested.store(true, Ordering::SeqCst);
+        self.0.set_state(SessionState::Stopping, Some("Stop requested.".into()));
+
+        let _ = self.send_command(serde_json::json!({ "cmd": "stop" }));
+
+        let child_slot = self.0.child.clone();
+        let id = self.0.id.clone();
+        let sink = self.0.sink.clone();
+
+        thread::spawn(move || {
+            let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
+            loop {
+                if Instant::now() > deadline {
+                    break;
+                }
+
+                {
+                    let mut guard = child_slot.lock().unwrap();
+                    match guard.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(_)) => return,
+                            Ok(None) => {}
+                            Err(_) => return,
+                        },
+                        None => return,
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            let mut guard = child_slot.lock().unwrap();
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            drop(guard);
+
+            sink.log(
+                &id,
+                "warn",
+                "The collector did not stop within the timeout and was terminated.",
+            );
+        });
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Description of what a session should collect. Mirrors the collector's CLI options.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRequest {
+    pub pid: i32,
+    #[serde(default)]
+    pub probes: Vec<String>,
+    #[serde(default)]
+    pub interval_ms: Option<u32>,
+    #[serde(default)]
+    pub max_types: Option<u32>,
+    #[serde(default)]
+    pub verbose: bool,
+    ///
+    /// Copy the raw EventPipe stream to a `.nettrace` beside the recordings, so the collector
+    /// can resolve allocation call sites from it once the session stops.
+    ///
+    /// This is the one capability that cannot be served live: turning an instruction pointer
+    /// into a method name needs the module and method maps from a complete stream, which is why
+    /// the answer arrives after detaching rather than while the session runs.
+    #[serde(default)]
+    pub deep_capture: bool,
+    /// Write this session's event stream to disk as it arrives.
+    #[serde(default)]
+    pub record: bool,
+    /// An explicit destination. Omitted means an auto-named file in the recordings directory.
+    #[serde(default)]
+    pub record_path: Option<String>,
+    /// Target metadata for the recording's header and file name. The host cannot look it up
+    /// itself without spawning the collector a second time, and the UI already has it.
+    #[serde(default)]
+    pub target_name: Option<String>,
+    #[serde(default)]
+    pub target_runtime: Option<String>,
+}
+
+/// Starts a collector session and wires its output to the sink.
+///
+/// `recordings_dir` is where an auto-named recording is created; it is only consulted when
+/// the request asks for one, which keeps the tests free of filesystem setup.
+pub fn start_session(
+    sink: Arc<dyn EventSink>,
+    location: &CollectorLocation,
+    request: SessionRequest,
+    recordings_dir: Option<PathBuf>,
+) -> Result<SessionHandle, String> {
+    let (dotnet, assembly) = resolve_or_err(location)?;
+
+    if request.pid <= 0 {
+        return Err("A valid process id is required.".into());
+    }
+
+    let interval = request.interval_ms.unwrap_or(1000).max(100);
+    let max_types = request.max_types.unwrap_or(150).max(10);
+
+    let recorder = if request.record || request.record_path.is_some() {
+        Some(open_recording(
+            &request,
+            recordings_dir.as_deref(),
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    // The capture is the collector's own artifact: the host only decides where it goes, and it
+    // goes next to the recordings because that is the folder the app already owns and shows.
+    let capture_path = if request.deep_capture {
+        let dir = recordings_dir
+            .as_deref()
+            .ok_or_else(|| "No capture directory is available for a deep capture.".to_string())?;
+        fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
+        Some(dir.join(format!("capture-{}-{}.nettrace", request.pid, now_unix_ms())))
+    } else {
+        None
+    };
+
+    let mut command = Command::new(dotnet);
+    command
+        .arg(assembly)
+        .arg("watch")
+        .arg("--pid")
+        .arg(request.pid.to_string())
+        .arg("--interval")
+        .arg(interval.to_string())
+        .arg("--max-types")
+        .arg(max_types.to_string());
+
+    if !request.probes.is_empty() {
+        command.arg("--probes").arg(request.probes.join(","));
+    }
+
+    if request.verbose {
+        command.arg("--verbose");
+    }
+
+    if let Some(path) = &capture_path {
+        command.arg("--capture").arg(path);
+    }
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start the collector process: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("The collector produced no stdout.")?;
+    let stderr = child.stderr.take().ok_or("The collector produced no stderr.")?;
+    let stdin = child.stdin.take();
+
+    let session_id = format!("pid{}-{}", request.pid, now_unix_ms());
+
+    let inner = Arc::new(SessionInner {
+        sink: sink.clone(),
+        id: session_id.clone(),
+        pid: request.pid,
+        state: Mutex::new(SessionState::Starting),
+        child: Arc::new(Mutex::new(Some(child))),
+        stdin: Mutex::new(stdin),
+        stop_requested: AtomicBool::new(false),
+        stats: SessionStats::default(),
+        started_at_unix_ms: now_unix_ms(),
+        message_counts: Mutex::new(HashMap::new()),
+        recorder: Mutex::new(recorder),
+    });
+
+    let handle = SessionHandle(inner.clone());
+    handle.0.set_state(SessionState::Running, None);
+
+    spawn_stdout_pump(sink.clone(), inner.clone(), stdout);
+    spawn_stderr_pump(sink, inner.clone(), stderr);
+
+    Ok(handle)
+}
+
+/// Opens a recording for a session: at an explicit path if one was given, otherwise as an
+/// auto-named file in the recordings directory.
+fn open_recording(
+    request: &SessionRequest,
+    recordings_dir: Option<&Path>,
+    started_mid_session: bool,
+) -> Result<Arc<RecordingWriter>, String> {
+    let target = RecordingTarget {
+        pid: request.pid,
+        name: request.target_name.clone(),
+        runtime_version: request.target_runtime.clone(),
+    };
+
+    // Recorded as given, including the tunables: a replay should be able to say why there is
+    // a sample every two seconds instead of every one.
+    let options = serde_json::json!({
+        "probes": request.probes,
+        "intervalMs": request.interval_ms,
+        "maxTypes": request.max_types,
+        "verbose": request.verbose,
+        "deepCapture": request.deep_capture,
+    });
+
+    match request.record_path.as_deref() {
+        Some(path) => RecordingWriter::create_at(Path::new(path), target, options, started_mid_session),
+        None => {
+            let dir = recordings_dir.ok_or_else(|| {
+                "No recordings directory is available; pass an explicit recording path.".to_string()
+            })?;
+            RecordingWriter::create(dir, target, options, started_mid_session)
+        }
+    }
+}
+
+/// Reads the collector's stdout, batches messages and forwards them to the frontend.
+///
+/// Batching is not cosmetic: a heavily collecting runtime emits hundreds of GC and
+/// allocation events per second, and one IPC round trip per event would saturate the webview
+/// while adding nothing the UI can render (it repaints at most once per frame).
+fn spawn_stdout_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stdout: std::process::ChildStdout) {
+    // A dedicated reader thread feeds lines into a channel so this thread can flush a stale
+    // batch on a deadline. Reading stdout directly would block, and a blocking read holds the
+    // first messages of a quiet session hostage until the *next* line arrives: a probe set
+    // whose only member reports at the end — a deep capture, say — would show nothing at all
+    // until it finished.
+    let (lines_tx, lines_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+        // Dropping the sender ends the loop below.
+    });
+
+    thread::spawn(move || {
+        let mut batch: Vec<serde_json::Value> = Vec::with_capacity(MESSAGE_BATCH_SIZE);
+        let mut last_flush = Instant::now();
+
+        loop {
+            let line = match lines_rx.recv_timeout(MESSAGE_BATCH_INTERVAL) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    // Nothing arrived within the batch window: send what is buffered anyway.
+                    if !batch.is_empty() {
+                        sink.messages(&inner.id, std::mem::take(&mut batch));
+                        last_flush = Instant::now();
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => {
+                    // Unparseable output is a collector bug, not a reason to stop.
+                    inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+            // Recorded before dispatch, and independently of it: a recording is the raw
+            // evidence, so it must not depend on which message types this build of the host
+            // happens to understand.
+            if let Some(recorder) = inner.recorder() {
+                recorder.record_message(&value);
+            }
+
+            inner.stats.messages.fetch_add(1, Ordering::Relaxed);
+
+            let message_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+            if let Ok(mut counts) = inner.message_counts.lock() {
+                *counts.entry(message_type.to_string()).or_insert(0) += 1;
+            }
+
+            match message_type {
+                "counter.sample" => {
+                    inner.stats.counters.fetch_add(1, Ordering::Relaxed);
+                }
+                "allocation.sample" => {
+                    inner.stats.allocation_samples.fetch_add(1, Ordering::Relaxed);
+                }
+                "gc.event" => {
+                    inner.stats.gc_events.fetch_add(1, Ordering::Relaxed);
+                }
+                "target.exited" => {
+                    inner.set_state(SessionState::Stopping, Some("The target process exited.".into()));
+                }
+                _ => {}
+            }
+
+            batch.push(value);
+
+            if batch.len() >= MESSAGE_BATCH_SIZE || last_flush.elapsed() >= MESSAGE_BATCH_INTERVAL {
+                sink.messages(&inner.id, std::mem::take(&mut batch));
+                last_flush = Instant::now();
+            }
+        }
+
+        sink.messages(&inner.id, std::mem::take(&mut batch));
+
+        let mut exit_detail = None;
+        if let Ok(mut guard) = inner.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                match child.wait() {
+                    Ok(status) => {
+                        exit_detail = Some(match status.code() {
+                            Some(0) => "The collector stopped cleanly.".to_string(),
+                            Some(code) => format!("The collector exited with code {code}."),
+                            None => "The collector was terminated by a signal.".to_string(),
+                        });
+                    }
+                    Err(e) => exit_detail = Some(format!("Could not read the collector exit status: {e}")),
+                }
+            }
+        }
+
+        let failed = !inner.stop_requested.load(Ordering::SeqCst)
+            && exit_detail.as_deref().is_some_and(|d| !d.contains("cleanly"));
+
+        // The footer is written before the final status is reported, so that by the time the
+        // UI believes the session has ended the file on disk is already complete.
+        let end_reason = if failed {
+            "collector-failed"
+        } else if inner.stop_requested.load(Ordering::SeqCst) {
+            "detached"
+        } else if inner
+            .message_counts
+            .lock()
+            .map(|counts| counts.contains_key("target.exited"))
+            .unwrap_or(false)
+        {
+            "target-exited"
+        } else {
+            "collector-exited"
+        };
+
+        if let Some(recorder) = inner.recorder() {
+            recorder.finish(end_reason, inner.stats_snapshot());
+        }
+
+        inner.set_state(
+            if failed { SessionState::Failed } else { SessionState::Stopped },
+            exit_detail,
+        );
+    });
+}
+
+fn spawn_stderr_pump(sink: Arc<dyn EventSink>, inner: Arc<SessionInner>, stderr: std::process::ChildStderr) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Collector stderr is diagnostics, not metrics, but it is often the only clue
+            // about why a recording is sparse, so it goes into the file too.
+            if let Some(recorder) = inner.recorder() {
+                recorder.record_log("debug", line);
+            }
+
+            sink.log(&inner.id, "debug", line);
+        }
+    });
+}

@@ -1,0 +1,28 @@
+[package]
+name = "memoryspy"
+version = "0.1.0"
+description = "Desktop memory profiler for .NET processes"
+authors = ["murategnc"]
+edition = "2021"
+rust-version = "1.77"
+
+# The `_lib` suffix keeps the library name distinct from the binary name on Windows.
+# See https://github.com/rust-lang/cargo/issues/8519
+[lib]
+name = "memoryspy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

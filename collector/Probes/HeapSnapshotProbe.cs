@@ -111,13 +111,25 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
     /// number was the buffer's capacity, not the graph's — while the nodes declared 25 025 617.
     ///
     /// The proper fix is <c>EventPipeBufferingMode.Block</c>, which stalls the target instead of
-    /// dropping, and that is what <c>dotnet-gcdump</c> uses. It is not reachable from here: the
-    /// configuration-based <c>StartEventPipeSession</c> sends the newer IPC command, and the .NET
-    /// 10.0.9 diagnostics server answers <c>UnsupportedCommandException</c> ("Start failed - Command
-    /// is not supported"). So the buffer is the lever, it is paid for in the target's memory, and the
-    /// shortfall is measured and reported rather than assumed away.
+    /// dropping. It is not universally reachable: the configuration-based
+    /// <c>StartEventPipeSession</c> that carries it sends the newer IPC command, and the
+    /// diagnostics servers measured so far all refuse it — .NET 10.0.9 and .NET 7.0.3 alike
+    /// answer <c>UnsupportedCommandException</c> ("Start failed - Command is not supported").
+    /// The working mitigation is the pump relay the parser reads through (see
+    /// <see cref="RelayStream"/>): it drains the session at memcpy speed, so a walk paced like
+    /// a real service's — seconds, not a sub-second burst — never falls behind at all. The
+    /// buffer remains the fallback's headroom, and the shortfall is measured and reported
+    /// rather than assumed away.
     /// </summary>
     private const int SnapshotBufferMb = 512;
+
+    /// <summary>
+    /// Buffer used when Block buffering is accepted. Block stalls the emitting thread when the
+    /// buffer is full instead of discarding, so the size only decides how often the target is
+    /// stalled for the reader to catch up — the walk cannot lose data at any size. A modest
+    /// quantum keeps the target's memory cost low while giving the parser room to drain in.
+    /// </summary>
+    private const int BlockBufferMb = 64;
 
     /// <summary>How many types the payload ranks by live bytes.</summary>
     private const int MaxReportedTypes = 40;
@@ -207,6 +219,10 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
     private readonly object _gate = new();
     private Thread? _worker;
     private int _snapshotCounter;
+
+    /// <summary>Whether the running snapshot's session stalls instead of dropping on a full
+    /// buffer — set per attempt, because acceptance depends on the target's runtime version.</summary>
+    private volatile bool _losslessBuffering;
 
     public string Id => "heap-snapshot";
     public string DisplayName => "Heap Snapshot";
@@ -325,24 +341,68 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
             try
             {
                 // No rundown: the heap walk carries its own type table, so method/module rundown
-                // would only add events this probe ignores. The buffer is raised because the walk
-                // emits the whole heap faster than it can be parsed here.
-                session = client.StartEventPipeSession(providers, requestRundown: false, circularBufferMB: SnapshotBufferMb);
+                // would only add events this probe ignores. Block buffering first — the walk
+                // cannot lose a reference to a full buffer when the writer is stalled instead of
+                // dropped — with the drop buffer as the fallback for a runtime that refuses the
+                // newer IPC command (.NET 10 does; measured, see SnapshotBufferMb).
+                var blocking = new EventPipeSessionConfiguration(
+                    providers,
+                    BlockBufferMb,
+                    rundownKeyword: 0,
+                    requestStackwalk: false,
+                    EventPipeBufferingMode.Block);
+                session = client.StartEventPipeSession(blocking);
+                _losslessBuffering = true;
             }
-            catch (Exception ex)
+            catch (Exception refused)
             {
-                _context.Error(
-                    $"Heap snapshot {index} could not start an EventPipe session on process {_context.Options.Pid}. " +
-                    "The target must be a running .NET process this user can attach to.",
-                    ex);
-                return;
+                // The refusal is worth one debug line: which runtimes accept Block buffering
+                // is a fact about their diagnostics servers, and the only way to know the
+                // map is to record what each one said.
+                _context.Log(
+                    $"Heap snapshot {index}: lossless (Block) buffering refused by the target: {refused.GetType().Name}: {refused.Message}",
+                    "debug");
+
+                // Carried to the log below: the fallback buffer is drop-mode, and its measured
+                // shortfall is what the snapshot's own accounting reports when it happens.
+                try
+                {
+                    session = client.StartEventPipeSession(providers, requestRundown: false, circularBufferMB: SnapshotBufferMb);
+                    _losslessBuffering = false;
+                }
+                catch (Exception ex)
+                {
+                    _context.Error(
+                        $"Heap snapshot {index} could not start an EventPipe session on process {_context.Options.Pid}. " +
+                        "The target must be a running .NET process this user can attach to.",
+                        ex);
+                    return;
+                }
             }
 
             _context.Log(
                 $"Heap snapshot {index}: asked the runtime for a heap walk. The target pauses for one Gen 2 collection, " +
-                $"and the walk is bounded at {SnapshotTimeoutMs / 1000} s.");
+                $"and the walk is bounded at {SnapshotTimeoutMs / 1000} s. Buffering: " +
+                (_losslessBuffering
+                    ? "lossless (the target stalls rather than dropping events)."
+                    : $"drop-buffer {SnapshotBufferMb} MB (the runtime refused lossless buffering); a shortfall is reported if events are lost."));
 
-            using var source = new EventPipeEventSource(session.EventStream);
+            // The runtime emits the walk faster than TraceEvent parses it, and a drop-mode
+            // session throws away whatever its reader leaves behind — measured on a 16.4 M node
+            // heap, the 512 MB buffer delivered 11.9 M objects of which 289 could still be
+            // attributed to a root. The relay decouples the two speeds: its pump drains the
+            // session at memcpy speed, which no GC walk can out-pace, while the parser consumes
+            // the buffered copy at its own pace. The cost is collector memory for the buffered
+            // dump (about 40 bytes per object), which is the price of a complete graph.
+            var relay = new RelayStream();
+            var pump = new Thread(() => relay.PumpFrom(session.EventStream))
+            {
+                IsBackground = true,
+                Name = "memoryspy-heap-pump",
+            };
+            pump.Start();
+
+            using var source = new EventPipeEventSource(relay);
             sampler.Attach(source);
 
             // The stream only ends when the session stops, and the session only stops when the
@@ -475,6 +535,123 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
     {
         public volatile bool Complete;
         public int GcNumber = -1;
+    }
+
+    /// <summary>
+    /// A single-producer, single-consumer pipe between the thread draining the runtime's
+    /// session stream and the TraceEvent parser reading the heap walk.
+    ///
+    /// Why it exists: the session's circular buffer drops events the moment its reader falls
+    /// behind, and the reader is TraceEvent, whose per-event parsing is far slower than the
+    /// runtime's walk. Decoupling them with this relay lets the pump drain the session at
+    /// memcpy speed — no GC walk can emit that fast — so the drop condition never arises,
+    /// regardless of heap size or the runtime's buffering mode. The buffered bytes are the
+    /// whole dump, held until the parser consumes them; that memory is the price of a graph
+    /// with every object and every reference in it.
+    /// </summary>
+    private sealed class RelayStream : Stream
+    {
+        private readonly Queue<(byte[] Buffer, int Length)> _chunks = new();
+        private (byte[] Buffer, int Length)? _head;
+        private int _headOffset;
+        private readonly SemaphoreSlim _chunksAvailable = new(0);
+        private Exception? _pumpFailure;
+        private bool _complete;
+
+        /// <summary>Drains the session stream into the relay until it ends. Runs on the pump thread.</summary>
+        public void PumpFrom(Stream source)
+        {
+            var buffer = new byte[1 << 18];
+            try
+            {
+                int read;
+                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    Enqueue(buffer, read);
+                    buffer = new byte[1 << 18];
+                }
+            }
+            catch (Exception ex)
+            {
+                Fail(ex);
+                return;
+            }
+
+            MarkComplete();
+        }
+
+        private void Enqueue(byte[] buffer, int length)
+        {
+            lock (_chunks)
+                _chunks.Enqueue((buffer, length));
+            _chunksAvailable.Release();
+        }
+
+        private void MarkComplete()
+        {
+            lock (_chunks)
+                _complete = true;
+            _chunksAvailable.Release();
+        }
+
+        private void Fail(Exception ex)
+        {
+            lock (_chunks)
+                _pumpFailure = ex;
+            _chunksAvailable.Release();
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            while (true)
+            {
+                if (_head is { } head)
+                {
+                    var take = Math.Min(buffer.Length, head.Length - _headOffset);
+                    head.Buffer.AsSpan(_headOffset, take).CopyTo(buffer);
+                    _headOffset += take;
+                    if (_headOffset >= head.Length)
+                        _head = null;
+                    return take;
+                }
+
+                (byte[] Buffer, int Length) chunk;
+                lock (_chunks)
+                {
+                    if (_chunks.Count > 0)
+                        chunk = _chunks.Dequeue();
+                    else if (_pumpFailure is not null)
+                        throw new IOException("The heap walk stream failed.", _pumpFailure);
+                    else if (_complete)
+                        return 0;
+                    else
+                        chunk = (Array.Empty<byte>(), 0);
+                }
+
+                if (chunk.Length == 0)
+                {
+                    _chunksAvailable.Wait();
+                    continue;
+                }
+
+                _head = chunk;
+                _headOffset = 0;
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => Read(buffer.AsSpan(offset, count));
+
+        public override void Flush() { }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     /// <summary>

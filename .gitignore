@@ -19,6 +19,8 @@ samples/*/bin/
 samples/*/obj/
 src-tauri/resources/collector/*
 !src-tauri/resources/collector/README.md
+src-tauri/resources/collector-docker/*
+!src-tauri/resources/collector-docker/README.md
 
 # Editor directories and files
 .vscode/*

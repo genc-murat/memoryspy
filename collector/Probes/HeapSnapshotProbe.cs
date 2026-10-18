@@ -166,14 +166,19 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
 
     /// <summary>
     /// How far the delivered references may drift from the ones the nodes declare before
-    /// positional attribution is treated as unusable.
+    /// attribution is treated as unusable.
     ///
-    /// The format gives an edge event no source node — the source is the node that owns the next
-    /// slot in the edge sequence — so attribution survives a small shortfall (a few lost events
-    /// shift a handful of nodes) and is worthless under a large one. Measured: with the default
-    /// buffer the graph was short by 79% of its references, and with a raised buffer the difference
-    /// fell to 471 of 8.76 M (0.005%). Half a percent leaves room for a lost batch while still
-    /// refusing to draw a path through a graph that is mostly missing.
+    /// The format gives an edge event no source node — the source is the node that owns the
+    /// next slot in the edge sequence — so any gap, of any size, shifts every reference after
+    /// it to a different owner; there is no such thing as a gap that moves "a few parents".
+    /// This tolerance therefore does not license small mismatches as harmless: it decides when
+    /// the walk is still attempted at all, and the reachable-share check is what then vouches
+    /// for the result — a graph whose parentage broke where it matters collapses to a fraction
+    /// of the walk and refuses to report chains. Measured: with the default buffer the graph
+    /// was short by 79% of its references; with the relay pump the difference on a real
+    /// service's heap fell to 4 154 of 21 M (0.02%) — as an *excess*, the signature of node
+    /// events the runtime never delivered — and the reachable share fell to 2.5%, correctly
+    /// suppressing the chains.
     /// </summary>
     private const double EdgeAttributionTolerance = 0.005;
 
@@ -957,20 +962,36 @@ public sealed class HeapSnapshotProbe : ICollectorProbe
 
             if (share > EdgeAttributionTolerance)
             {
+                // Which side is short names what the runtime failed to deliver: fewer edges
+                // than the nodes declare is dropped edge events; more edges than the delivered
+                // nodes declare can only mean node events that never arrived (their edges did,
+                // their declarations did not). Measured on .NET 7.0.3 against a real service:
+                // +4 154 of 21 M — the walk itself loses nodes.
+                var lost =
+                    difference > 0 ? "the runtime dropped edge events on the way here" :
+                    "the runtime never delivered some of the nodes (their references arrived without the nodes that declare them)";
                 note =
                     $"The nodes declare {expectedEdges:N0} references but {_edgeTargets.Count:N0} were delivered " +
-                    $"({share:P1} apart), so references cannot be attributed to the objects that own them. " +
-                    "Retention paths are not reported; the per-type totals above are unaffected.";
+                    $"({share:P1} apart): {lost}. The format gives a reference no owner but position — it belongs to " +
+                    "whichever node holds the next slot — so a gap anywhere shifts every reference after it to a " +
+                    "different owner, and parentage cannot be attributed. Retention paths are not reported; the " +
+                    "per-type totals above are unaffected.";
                 _context.Log($"Heap snapshot: {note}", "warn");
                 return (new List<RetentionPath>(), note, 0, null, null);
             }
 
             if (difference != 0)
             {
+                // Still inside tolerance, so the chains are attempted — but the wording must not
+                // minimise what a nonzero difference means: the shift is cumulative from the
+                // first (undetectable) gap onward, not "a few objects' parents". What keeps this
+                // usable is the reachable check further down: a graph whose parentage broke
+                // where it matters collapses to a fraction of the walk and refuses to report.
                 note =
                     $"The nodes declare {expectedEdges:N0} references and {_edgeTargets.Count:N0} were delivered " +
-                    $"({share:P2} apart), so a few objects' parents may be shifted; the chains and root kinds are the " +
-                    "runtime's own.";
+                    $"({share:P2} apart). The format attributes a reference to its owner by position, so a gap of " +
+                    "any size shifts the references that follow it; the walk below is still attempted because the " +
+                    "difference is this small, and its reachable share is what vouches for the chains it reports.";
                 _context.Log($"Heap snapshot: {note}", "debug");
             }
 

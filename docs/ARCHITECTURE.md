@@ -32,6 +32,40 @@ Practical reasons for the process boundary:
 The cost is a spawn per session (~200 ms) and a JSON hop. Both are irrelevant next to the
 runtime's own 1 s counter interval.
 
+## Targets in a container
+
+The runtime's diagnostics endpoint is a filesystem socket whose name contains the target's pid,
+and the client library resolves it *by pid*. A host-side collector therefore cannot see a
+containerised target twice over: the socket lives in the container's mount namespace (not the
+host's `/tmp`), and the pid that names it is the container's pid, not the host namespace's. On
+Docker Desktop neither condition can be repaired, because containers run inside a Linux VM and
+their pids do not exist on the host at all.
+
+So the transport moves the collector instead of the socket. A single-file self-contained Linux
+publish (`npm run collector:docker`) is copied into the container with `docker cp` and started
+with `docker exec -i`; the host keeps reading the same NDJSON pipe and writing the same stdin
+commands. Nothing above this boundary knows the difference — probes, diagnosis, recordings and
+replay are unchanged, and a session is still exactly one EventPipe session.
+
+Two details are load-bearing rather than incidental:
+
+- **stdin is the liveness signal.** A `docker exec` client that dies closes the pipe. The
+  collector treats stdin EOF as "the host is gone" and stops; before that it kept the session
+  alive (measured: two orphaned collectors in one container, each still attached to the target).
+- **The capture is a container path until it is copied out.** A deep capture is written to
+  `/tmp` *inside* the container, analysed there, and copied to the recordings folder after the
+  collector exits. The analysis therefore resolves source lines from PDBs inside the image; an
+  image without PDBs reports method names, exactly as a stripped build on the host does. Once
+  the copy lands, the host sends `capture.copied` with the local path so the UI stops naming a
+  file that only existed inside the container; when it cannot land, `capture.copyFailed` keeps
+  that container path on screen with the reason, so it is never mistaken for a local file. The
+  in-between window is a state of its own — the copy-out can take minutes on a large capture —
+  so the frontend marks the capture's location at attach time and only offers to reveal a path
+  once the host has said it is on this machine.
+
+The collector runs as the image's user, which is normally the target's user — the same
+requirement .NET puts on any diagnostics client.
+
 ## Why one EventPipe session per target
 
 Every additional EventPipe session on a target process costs it another buffer and another
@@ -78,6 +112,7 @@ Message types emitted today:
 | `gc.summary` | gc-stats | cumulative collection counts and finalizer activity |
 | `allocation.site` | allocation-sites | sampled allocations folded by call site (file:line from the module's PDB, or the method when no PDB was readable) and by type, resolved from a finished raw capture |
 | `process.list` / `process.detail` | – | attachable .NET processes |
+| `capture.copied` / `capture.copyFailed` | – | **host-originated**, not collector messages: after a container capture is copied out, the path on this machine plus its size — or the container path that still holds it and the CLI's reason |
 | `error` / `log` | any | diagnostics |
 
 The envelope is versioned (`v`). Adding a message type or a field is not a breaking change;
@@ -105,7 +140,9 @@ Three decisions shape it.
 travels through exactly one place — the session's stdout pump — and that is where
 `RecordingWriter` appends it, *before* dispatch, so a recording never depends on which
 message types this build of the host happens to understand. A new probe is therefore
-recorded for free. The writer buffers and flushes on a 250 ms timer: the cost of a message
+recorded for free. A message the host itself adds (`capture.copied`, `capture.copyFailed`) is
+recorded at the point it is published, so replaying a container session names the copy that was
+made rather than a path that only existed inside the container. The writer buffers and flushes on a 250 ms timer: the cost of a message
 is one buffered write, and a crash costs at most the last quarter second.
 
 **Replay reuses the live path.** A player parses the file and pushes the recorded envelopes
@@ -136,6 +173,18 @@ Some smaller consequences worth knowing:
 - **Deletion is confined** to the recordings folder, enforced by resolving real paths
   (`recording::resolve_inside`) rather than comparing strings, and refused while the file is
   being read by a replay or written by a session.
+- **Revealing an artifact goes through the host.** A webview cannot launch Finder or Explorer,
+  so a path printed in the UI is a dead end on its own. `reveal_in_folder` asks the OS to select
+  the file (`open -R`, `explorer /select,`, or `xdg-open` on its folder), and the rail's capture
+  and recording paths and every row of the recordings library share one button. The existence
+  check runs before launching, because each file manager words "no such file" differently and
+  the UI has to answer "moved or deleted" in its own words rather than pass along three
+  dialects. The launcher's own exit is read only where that is meaningful: macOS waits for
+  `open` and reports its refusal (the file went away between the check and the click), Windows
+  ignores `explorer.exe`'s status because it exits 1 after a success, and Linux gives `xdg-open`
+  one moment — a launcher with nowhere to go fails at once with a message worth showing, while
+  one that opened a window stays attached and is reaped in the background rather than waited
+  on.
 
 ### Reading a file you did not write
 

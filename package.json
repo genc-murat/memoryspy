@@ -13,6 +13,7 @@
     "collector:build": "dotnet build collector -c Debug",
     "collector:release": "dotnet build collector -c Release",
     "collector:publish": "node scripts/publish-collector.mjs",
+    "collector:docker": "node scripts/publish-collector-docker.mjs",
     "sample:build": "dotnet build samples/LeakyCache -c Debug",
     "sample:run": "dotnet run --project samples/LeakyCache --",
     "app:dev": "tauri dev",

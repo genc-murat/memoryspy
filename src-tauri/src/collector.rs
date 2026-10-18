@@ -323,7 +323,7 @@ pub fn locate_collector() -> CollectorLocation {
 /// Deliberately not `CREATE_NEW_PROCESS_GROUP` or `DETACHED_PROCESS`: the session is stopped by
 /// writing to its stdin and killing it if it does not comply, which needs an ordinary child, not a
 /// detached one. A no-op off Windows.
-fn without_console_window(command: &mut Command) -> &mut Command {
+pub(crate) fn without_console_window(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -435,7 +435,21 @@ pub fn list_processes(
         .map_err(|e| format!("Failed to run the collector: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_process_list(&stdout).map_err(|error| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().is_empty() {
+            format!("{error} No error output was produced.")
+        } else {
+            format!("{error} {}", stderr.trim())
+        }
+    })
+}
 
+/// Extracts the process list from a collector's stdout.
+///
+/// Shared with the Docker transport, which runs the same `list` command *inside* a container and
+/// therefore has to read the same envelope.
+pub(crate) fn parse_process_list(stdout: &str) -> Result<Vec<DotnetProcessInfo>, String> {
     // The collector emits the envelope on stdout; the first well formed line is the answer.
     for line in stdout.lines() {
         let line = line.trim();
@@ -456,15 +470,7 @@ pub fn list_processes(
         }
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "The collector did not return a process list. {}",
-        if stderr.trim().is_empty() {
-            "No error output was produced.".to_string()
-        } else {
-            stderr.trim().to_string()
-        }
-    ))
+    Err("The collector did not return a process list.".to_string())
 }
 
 /// Runs the collector's `capabilities` command so the UI can build panels dynamically.
@@ -530,6 +536,10 @@ struct SessionInner {
     sink: Arc<dyn EventSink>,
     id: String,
     pid: i32,
+    /// The container this session's target runs in, when it is not a host process.
+    container: Option<String>,
+    /// A capture written inside a container, waiting to be copied out after the collector exits.
+    capture_copy: Option<CaptureCopy>,
     state: Mutex<SessionState>,
     // The child handle is shared with the stop and reader threads, so it needs its own
     // `Arc` on top of the `Mutex`: the session itself is cloned into those threads.
@@ -592,6 +602,11 @@ impl SessionHandle {
         self.0.pid
     }
 
+    /// The container this session's target runs in, if any.
+    pub fn container(&self) -> Option<&str> {
+        self.0.container.as_deref()
+    }
+
     pub fn state(&self) -> SessionState {
         *self.0.state.lock().unwrap()
     }
@@ -600,6 +615,7 @@ impl SessionHandle {
         serde_json::json!({
             "sessionId": self.0.id,
             "pid": self.0.pid,
+            "container": self.0.container,
             "state": self.state(),
             "stats": self.0.stats_snapshot(),
             "recording": self.0.recorder().map(|recorder| recorder.summary()),
@@ -649,6 +665,7 @@ impl SessionHandle {
             record_path: path,
             target_name,
             target_runtime,
+            container: self.0.container.clone(),
         };
 
         // Flagged as mid-session so no reader mistakes the first message for the start of the
@@ -757,6 +774,37 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wraps a message the *host* contributes in the collector's envelope.
+///
+/// Copying a container capture out is a host concern, but the webview already ingests one
+/// message channel, so the answer travels on that channel instead of a second event the UI
+/// would have to learn. `seq` is 0 because host messages are outside the collector's sequence,
+/// which only orders its own output.
+fn host_message(message_type: &str, data: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "v": 1,
+        "seq": 0,
+        "ts": now_unix_ms(),
+        "type": message_type,
+        "data": data,
+    })
+}
+
+/// Publishes a host-originated message on the channel the UI already reads, and records it.
+///
+/// The recorder in the stdout pump only sees the collector's own output, so without this a
+/// replayed container session would present the in-container `/tmp/…` path as a file on whatever
+/// machine plays the recording — and never name the copy that was made beside the recordings.
+fn emit_host_message(inner: &SessionInner, message_type: &str, data: serde_json::Value) {
+    let message = host_message(message_type, data);
+
+    if let Some(recorder) = inner.recorder() {
+        recorder.record_message(&message);
+    }
+
+    inner.sink.messages(&inner.id, vec![message]);
+}
+
 /// Description of what a session should collect. Mirrors the collector's CLI options.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -796,6 +844,34 @@ pub struct SessionRequest {
     pub target_name: Option<String>,
     #[serde(default)]
     pub target_runtime: Option<String>,
+    /// Name or id of a Docker container the target runs in. Omitted means a process on this
+    /// machine, launched directly.
+    #[serde(default)]
+    pub container: Option<String>,
+}
+
+/// A capture that has to be retrieved from a container once the collector exits.
+struct CaptureCopy {
+    container: String,
+    remote: String,
+    local: PathBuf,
+}
+
+/// Makes a container name or id safe to embed in a session id.
+fn session_key(container: &str) -> String {
+    let key: String = container
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(40)
+        .collect();
+
+    // A name made entirely of characters a session id cannot carry still has to produce an id
+    // that can be read in a log.
+    if key.is_empty() {
+        "container".to_string()
+    } else {
+        key
+    }
 }
 
 /// Starts a collector session and wires its output to the sink.
@@ -808,11 +884,36 @@ pub fn start_session(
     request: SessionRequest,
     recordings_dir: Option<PathBuf>,
 ) -> Result<SessionHandle, String> {
-    let (dotnet, arguments) = resolve_launch(location)?;
-
     if request.pid <= 0 {
         return Err("A valid process id is required.".into());
     }
+
+    let container = request
+        .container
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    // Two transports, one protocol. Locally the collector is launched directly; inside a
+    // container it is launched through `docker exec -i`, because the diagnostics socket it has to
+    // open lives in the container's own filesystem and PID namespaces. Either way stdout and
+    // stdin are the NDJSON channel this module already pumps, so nothing downstream of here
+    // knows which one it got.
+    let (program, launcher_arguments) = match container {
+        Some(container) => {
+            let staged = crate::docker::ensure_collector(container)?;
+            (
+                crate::docker::cli(),
+                vec![
+                    "exec".to_string(),
+                    "-i".to_string(),
+                    container.to_string(),
+                    staged.path,
+                ],
+            )
+        }
+        None => resolve_launch(location)?,
+    };
 
     let interval = request.interval_ms.unwrap_or(1000).max(100);
     let max_types = request.max_types.unwrap_or(150).max(10);
@@ -825,23 +926,36 @@ pub fn start_session(
 
     // The capture is the collector's own artifact: the host only decides where it goes, and it
     // goes next to the recordings because that is the folder the app already owns and shows.
+    let file_name = format!("capture-{}-{}.nettrace", request.pid, now_unix_ms());
+    let mut capture_copy: Option<CaptureCopy> = None;
     let capture_path = if request.deep_capture {
         let dir = recordings_dir
             .as_deref()
             .ok_or_else(|| "No capture directory is available for a deep capture.".to_string())?;
         fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-        Some(dir.join(format!(
-            "capture-{}-{}.nettrace",
-            request.pid,
-            now_unix_ms()
-        )))
+
+        match container {
+            // The in-container collector can only write where the container can: `/tmp` exists in
+            // every image and needs nothing created first. The finished file is copied out after
+            // the collector exits, so the evidence outlives the container.
+            Some(container) => {
+                let remote = format!("/tmp/{file_name}");
+                capture_copy = Some(CaptureCopy {
+                    container: container.to_string(),
+                    remote: remote.clone(),
+                    local: dir.join(&file_name),
+                });
+                Some(remote)
+            }
+            None => Some(dir.join(file_name).display().to_string()),
+        }
     } else {
         None
     };
 
-    let mut command = Command::new(dotnet);
+    let mut command = Command::new(program);
     command
-        .args(arguments)
+        .args(launcher_arguments)
         .arg("watch")
         .arg("--pid")
         .arg(request.pid.to_string())
@@ -885,12 +999,22 @@ pub fn start_session(
         .ok_or("The collector produced no stderr.")?;
     let stdin = child.stdin.take();
 
-    let session_id = format!("pid{}-{}", request.pid, now_unix_ms());
+    let session_id = match container {
+        Some(container) => format!(
+            "docker-{}-pid{}-{}",
+            session_key(container),
+            request.pid,
+            now_unix_ms()
+        ),
+        None => format!("pid{}-{}", request.pid, now_unix_ms()),
+    };
 
     let inner = Arc::new(SessionInner {
         sink: sink.clone(),
         id: session_id.clone(),
         pid: request.pid,
+        container: container.map(str::to_string),
+        capture_copy,
         state: Mutex::new(SessionState::Starting),
         child: Arc::new(Mutex::new(Some(child))),
         stdin: Mutex::new(stdin),
@@ -1075,6 +1199,68 @@ fn spawn_stdout_pump(
                     Err(e) => {
                         exit_detail = Some(format!("Could not read the collector exit status: {e}"))
                     }
+                }
+            }
+        }
+
+        // A capture written inside a container is only evidence once it is on this machine. The
+        // collector closed and analysed the file before exiting, so this is the first moment the
+        // copy can be complete. Its failure is reported rather than fatal: every other message
+        // the session produced is already in the UI, and the file is still in the container.
+        if let Some(copy) = &inner.capture_copy {
+            match crate::docker::copy_out(&copy.container, &copy.remote, &copy.local) {
+                Ok(()) => {
+                    let bytes = fs::metadata(&copy.local)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+
+                    // Until now the only path the UI has is the collector's, and that one exists
+                    // inside the container. Once the copy has landed, keeping it would answer
+                    // "where is the capture?" with a file the user cannot open, so the host
+                    // corrects the record.
+                    emit_host_message(
+                        &inner,
+                        "capture.copied",
+                        serde_json::json!({
+                            "path": copy.local.display().to_string(),
+                            "bytes": bytes,
+                            "container": copy.container,
+                            "remote": copy.remote,
+                        }),
+                    );
+
+                    inner.sink.log(
+                        &inner.id,
+                        "info",
+                        &format!(
+                            "Capture copied out of {} to {}.",
+                            copy.container,
+                            copy.local.display()
+                        ),
+                    );
+                }
+                Err(error) => {
+                    // The file is still inside the container, and the path the collector reported
+                    // stays the only path there is. Saying so on the same channel is what stops
+                    // the rail from presenting `/tmp/…` as a file on this machine.
+                    emit_host_message(
+                        &inner,
+                        "capture.copyFailed",
+                        serde_json::json!({
+                            "container": copy.container,
+                            "remote": copy.remote,
+                            "error": error,
+                        }),
+                    );
+
+                    inner.sink.log(
+                        &inner.id,
+                        "warn",
+                        &format!(
+                            "The capture stayed inside {} at {}: {error}",
+                            copy.container, copy.remote
+                        ),
+                    );
                 }
             }
         }

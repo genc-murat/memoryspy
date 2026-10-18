@@ -96,6 +96,52 @@ yapıştırılabilir.
 
 ---
 
+## Konteynerdeki süreçler (Docker)
+
+Bir konteynerin tanı soketi kendi mount ve PID namespace'inde yaşar; host'ta çalışan collector o
+süreci ne listede görür ne de bağlanabilir. Docker Desktop'ta durum daha da net: konteynerler ayrı
+bir Linux VM'inde çalıştığı için host'ta o pid'ler hiç yoktur. MemorySpy bunu collector'ı
+konteynerin **içinde** çalıştırarak çözer — Linux build'i `docker cp` ile kopyalanır, `docker
+exec -i` ile başlatılır. Protokol aynı kaldığı için altı sekme, teşhis kuralları, kayıt ve replay
+değişmeden çalışır.
+
+Bir kez hazırla:
+
+```bash
+npm run collector:docker                  # makinenin mimarisi (Docker Desktop'ta doğru seçim)
+npm run collector:docker -- linux-x64     # amd64 image'lar için
+```
+
+Hangi build'lerin hazır olduğunu `memoryspy --check | jq .docker` söyler. Sonra sol raydaki
+**Containers** bölümünden bir konteynere bas: ilk açılışta collector (tek dosya, ~80 MB)
+konteynere kopyalanır ve `capabilities` ile gerçekten çalıştığı doğrulanır; ardından içindeki
+.NET süreçleri listelenir. Süreç satırına basmak normal attach'tır — derin yakalama ve kayıt
+dahil.
+
+Bilinmesi gerekenler:
+
+- Docker kurulu ama daemon kapalıysa bölüm gizlenmez: ray, daemon'un kendi hatasını gösterir ve
+  **Refresh** yeniden dener. Docker hiç kurulu değilse bölüm hiç görünmez (söylenecek bir şey yok).
+- Collector konteynerin varsayılan kullanıcısıyla çalışır; hedef başka bir kullanıcıysa ve o
+  kullanıcı root değilse sokete erişemez.
+- Kopya `/tmp/memoryspy-collector-<rid>-<sürüm>` altında durur ve konteyner yeniden başlayınca
+  kaybolur; bir sonraki attach'ta yeniden kopyalanır. Ad, uygulamanın taşıdığı binary'nin
+  kimliğini içerdiği için uygulama (ya da `collector:docker` çıktısı) güncellenince eski kopya
+  yeniden kullanılmaz — yoksa uzun ömürlü bir konteyner eski collector'la kalırdı. Salt-okunur
+  kök dosya sistemi olan konteynerlerde kopyalama başarısız olur ve bu açıkça bildirilir.
+- Belirleyici olan image'ın mimarisidir, makinenin değil: arm64 makinede amd64 bir image
+  `linux-x64` ister.
+- Derin yakalama önce konteynerin `/tmp`'sine yazılır, oturum bitince kayıt klasörüne kopyalanır.
+  PDB'ler konteynerde yoksa çağrı yerleri satır yerine metot adıyla görünür. Kopyalama
+  başarısız olursa ray bunu söyler ve dosyanın hâlâ konteynerde olduğunu belirtir.
+- **Show in Finder** düğmesi hem yakalama hem kayıt yolunun yanında, hem de Recordings
+  listesindeki her satırda durur. Dosya taşınmış ya da silinmişse arayüz bunu açıkça söyler;
+  boş bir klasör açıp kullanıcıya aramak bırakmaz. Konteyner yakalaması dışarı kopyalanana
+  kadar düğme görünmez: o sırada yol konteynerin içindedir ve ray bunu söyler.
+- `scratch` gibi glibc'siz image'larda collector çalışmaz; distroless çalışır (glibc vardır).
+
+---
+
 ## Uygulama içi görünümler
 
 | Sekme | Ne gösterir |
@@ -107,7 +153,7 @@ yapıştırılabilir.
 | **Heap Snapshot** | İstek üzerine canlı heap yürüyüşü: tür başına canlı nesne/bayt ve "silinirse boşalan" bayt, GC köklerinden canlı örneklere giden referans zincirleri ("bunu kim tutuyor?", halka başına tutulan alan), hedefin duraklama maliyeti |
 | **Diagnosis** | Bulgular: önem derecesi, kanıt sayıları ve yapılacaklar listesi |
 | **Diagnostics** | Collector stderr'i, oturum istatistikleri, sayıları sıfırlama |
-| **Recordings** | Diskteki kayıtlar ve bunları çevrimdışı replay etme; başka makineden gelen dosyayı açma |
+| **Recordings** | Diskteki kayıtlar ve bunları çevrimdışı replay etme; başka makineden gelen dosyayı açma, dosyayı Finder/Explorer'da gösterme |
 | **Settings** | Collector yolu, örnekleme varsayılanları, collector'ın bildirdiği yetenekler |
 
 Verinin şeklini (büyüyor mu, hangi nesilde) sağ kenardaki **heap spine** gösterir.
@@ -339,6 +385,9 @@ Dürüst olmak gerekirse, bu sürümün yapamadıkları ve bilinçli tasarım ka
   host bunu reddeder.
 - Bağlanma izni .NET runtime'ın tanı IPC soketine bağlıdır. Farklı kullanıcıya ait veya
   `DOTNET_EnableDiagnostics=0` ile başlatılmış süreçlere bağlanılamaz.
+- **Konteyner desteği yerel Docker CLI'sı üzerinden çalışır.** Collector `docker cp` ile
+  konteynere kopyalanıp `docker exec -i` ile başlatılır; bu yüzden konteynerde yazılabilir bir
+  `/tmp` gerekir ve uzak bir Docker host'u ya da Kubernetes kümesi bu sürümde desteklenmez.
 - **Kayıtta saklama/silme politikası yok.** Diskte ne varsa o kalır; temizliği sen yaparsın
   (`Recordings` sekmesinden silinebilir, ama otomatik yaşlandırma yoktur).
 - **Replay aynı anda canlı oturumla çalışmaz.** İkisi de aynı tamponlara yazacağı için host
@@ -401,11 +450,37 @@ npm run dev
 
 Sahte mod, collector ile **aynı** mesaj zarfını üretir; yani gerçek protokolü doğrular.
 
+CI'da bu paket Ubuntu'da koşar ([.github/workflows/test.yml](.github/workflows/test.yml)): collector ve örnek
+önce derlenir, konteyner testleri için Linux collector publish edilir, ardından testler çalışır.
+Docker testleri atlanırsa iş **başarısız** olur — kapsamı ölçmeyen yeşil bir koşu, olmayan bir
+kapsamı raporlamak olurdu.
+
 Sözleşme testleri (`src-tauri/tests/collector_contract.rs`) örnek sızıntı uygulamasına
 gerçekten bağlanır ve şunları doğrular: collector bulunuyor mu, yetenekleri doğru mu
 bildiriyor, süreç listesi komut satırı ve runtime sürümüyle zenginleşiyor mu, canlı oturumda
 sayaçlar byte'a normalize ediliyor mu ve sızdıran `SessionRecord` tipi tür listesinde
 görünüyor mu, oturum temiz kapanıyor mu.
+
+Konteyner taşımasının CLI sözleşmesi — staged kopyanın adı, sıcak konteynerde yeniden kopyalanmaması,
+güncellenen collector'ın eskisinin yerine geçmesi, salt-okunur dosya sistemi ve çalışmayan binary
+hataları, kopyalama sırasında yarım kalan dosyanın silinmesi — sahte bir `docker` CLI'sı ile
+`cargo test --lib` içinde koşar; ne daemon ne de konteyner gerekir (Unix). Uçtan uca taşıma ise ayrı
+bir testtir ([docker_container.rs](src-tauri/tests/docker_container.rs)). Docker daemon'ı
+erişilebiliyorsa kendi hedefini kurar: daemon'ın mimarisi için sızdıran örneği publish eder,
+`dotnet/runtime` image'ından geçici bir konteyner başlatır, örneği içine kopyalar ve test bitince
+konteyneri siler. Yani elle bir şey hazırlamak gerekmez, tek ön koşul Linux collector'ın publish
+edilmiş olmasıdır:
+
+```bash
+npm run collector:docker
+cargo test --manifest-path src-tauri/Cargo.toml --test docker_container
+```
+
+Docker yoksa test atlanır (ve bunu söyler). Var olan bir konteynere bağlanmak için
+`MEMORYSPY_TEST_CONTAINER=<ad>` verilir; o zaman hiçbir şey oluşturulmaz veya silinmez. Farklı bir
+base image için `MEMORYSPY_TEST_IMAGE` kullanılır. Daemon varsa ama collector publish edilmemişse
+test **başarısız olur**: CI'da Docker'ın hiç çalıştırılmadığı bir koşunun yeşil görünmesi, bu
+testlerin önlemek için var olduğu şeydir.
 
 Bir de derin yakalama zinciri test edilir: gerçek bir capture yazılır, `.nettrace`
 diskte kalır, ara ETLX silinir, frame'ler isimle çözülür (örnek uygulamanın kendi `Program`

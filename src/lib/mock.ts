@@ -21,6 +21,8 @@ import type {
   CollectorLocation,
   CollectorMessage,
   CounterReading,
+  DockerContainer,
+  DockerStatus,
   DotnetProcessInfo,
   EnvironmentInfo,
   HeapSnapshotData,
@@ -33,6 +35,32 @@ import type {
   Settings,
   TypeSnapshot,
 } from './types';
+
+/** `?mock=1&docker=down` reviews the rail's "daemon is not reachable" state. */
+const MOCK_DOCKER_DOWN =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('docker') === 'down';
+
+/**
+ * `?mock=1&capture=lost` reviews the rail's "the capture stayed inside the container" state.
+ *
+ * The success path needs no switch: a mock session attached to a container process reports a
+ * container path while it runs and the copy-out on stop, exactly as the host does. Losing the
+ * copy is the state that only appears when Docker says no, so it takes a flag.
+ */
+const MOCK_CAPTURE_LOST =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('capture') === 'lost';
+
+/**
+ * `?mock=1&reveal=missing` reviews the rail's answer when the capture has been moved or deleted.
+ *
+ * The mock's capture paths do not exist on disk, so the default has to be the success answer:
+ * otherwise the one thing the button normally does could never be seen in a browser.
+ */
+const MOCK_REVEAL_MISSING =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('reveal') === 'missing';
 
 export const MOCK_ENABLED = (() => {
   if (typeof window === 'undefined') return false;
@@ -158,10 +186,60 @@ const PROCESSES: DotnetProcessInfo[] = [
   },
 ];
 
+/**
+ * A couple of containers, so the rail's Docker section can be reviewed without a daemon.
+ *
+ * They mirror the shape a real container session produces: the process *inside* the container
+ * has its own small pid, which is exactly the number `docker exec` expects and the reason a
+ * host-side process list never matches.
+ */
+const DOCKER_CONTAINERS: DockerContainer[] = [
+  {
+    id: 'c9b32d3932c4e997e9c86447cab39b015e96e3be62c70e13ec22fecf6862537f',
+    name: 'orders-api',
+    image: 'orders-api:2.14.0',
+    status: 'Up 12 minutes',
+  },
+  {
+    id: '1d72bf94318fb66ba15370185fee68ce4496e2fe3bb26531ee36fc8b135d65e0',
+    name: 'billing-worker',
+    image: 'billing-worker:0.9.3',
+    status: 'Up 2 hours',
+  },
+];
+
+const CONTAINER_PROCESSES: Record<string, DotnetProcessInfo[]> = {
+  'orders-api': [
+    {
+      pid: 7,
+      name: 'dotnet',
+      commandLine: 'dotnet /app/OrderService.Api.dll',
+      runtimeVersion: '10.0.9',
+      workingSetBytes: 1_180 * MB,
+      startTimeUnixMs: Date.now() - 1000 * 60 * 12,
+    },
+  ],
+  'billing-worker': [
+    {
+      pid: 1,
+      name: 'Billing.Worker',
+      commandLine: '/app/Billing.Worker',
+      runtimeVersion: '10.0.9',
+      workingSetBytes: 412 * MB,
+      startTimeUnixMs: Date.now() - 1000 * 60 * 118,
+    },
+  ],
+};
+
 let timer: ReturnType<typeof setInterval> | null = null;
 
 /** Set while a mock session is pretending to copy its raw event stream to disk. */
-let mockCapture: { path: string; startedAt: number } | null = null;
+let mockCapture: { path: string; startedAt: number; copiedTo: string | null } | null = null;
+
+/**
+ * Bumped on every attach, so a delayed copy-out from a previous session cannot land on a new one.
+ */
+let mockGeneration = 0;
 let seq = 0;
 
 function envelope<T>(type: string, probe: string | null, data: T): CollectorMessage<T> {
@@ -353,10 +431,22 @@ export function startMockStream(
   };
 }
 
-/** Begins streaming synthetic metrics, mirroring what an attach would produce. */
-export function beginMockSession(capturePath: string | null = null): SessionSnapshot {
+/**
+ * Begins streaming synthetic metrics, mirroring what an attach would produce.
+ *
+ * `capturePath` is where the *collector* writes, and `copiedTo` is where the host copies it —
+ * both are needed to rehearse a container session, whose capture only becomes a local file after
+ * the copy-out that `capture.copied` announces.
+ */
+export function beginMockSession(
+  capturePath: string | null = null,
+  copiedTo: string | null = null,
+): SessionSnapshot {
   const started = new Date();
-  mockCapture = capturePath ? { path: capturePath, startedAt: started.getTime() } : null;
+  mockGeneration += 1;
+  mockCapture = capturePath
+    ? { path: capturePath, startedAt: started.getTime(), copiedTo }
+    : null;
 
   handlers?.status({
     sessionId: SESSION_ID,
@@ -430,33 +520,89 @@ export function stopMockStream() {
   if (timer) clearInterval(timer);
   timer = null;
 
-  // A deep capture answers only once the stream has ended, so the mock does the same thing the
-  // real collector does: the analysis lands after the session stops, never during it.
-  const capture = mockCapture;
-  mockCapture = null;
-  if (capture) {
-    const bytes = 28_640_512;
-    handlers?.messages({
-      sessionId: SESSION_ID,
-      messages: [
-        envelope('target.exited', null, {
-          pid: MOCK_TARGET_PID,
-          eventsProcessed: 190_412,
-          flushOverruns: 0,
-          capture: { path: capture.path, bytes, truncated: false },
-        }),
-        envelope('allocation.site', 'allocation-sites', buildMockCallSites(bytes, Date.now() - capture.startedAt)),
-      ],
-    });
-  }
-
+  // The host marks the session stopping the moment it asks the collector to stop, before the
+  // collector has drained and before the copy-out; the rail leaves its live wording there and
+  // shows what the capture's path really is until the copy lands.
   handlers?.status({
     sessionId: SESSION_ID,
     pid: MOCK_TARGET_PID,
-    state: 'stopped',
-    detail: 'The mock session was detached.',
+    state: 'stopping',
+    detail: 'Stop requested.',
     stats: emptyStats(),
   });
+
+  const generation = mockGeneration;
+  const capture = mockCapture;
+  mockCapture = null;
+
+  const reportStopped = () => {
+    handlers?.status({
+      sessionId: SESSION_ID,
+      pid: MOCK_TARGET_PID,
+      state: 'stopped',
+      detail: 'The mock session was detached.',
+      stats: emptyStats(),
+    });
+  };
+
+  if (!capture) {
+    reportStopped();
+    return;
+  }
+
+  const bytes = 28_640_512;
+
+  // A deep capture answers only once the stream has ended, so the mock does the same thing the
+  // real collector does: the analysis lands after the session stops, never during it.
+  handlers?.messages({
+    sessionId: SESSION_ID,
+    messages: [
+      envelope('target.exited', null, {
+        pid: MOCK_TARGET_PID,
+        eventsProcessed: 190_412,
+        flushOverruns: 0,
+        capture: { path: capture.path, bytes, truncated: false },
+      }),
+      envelope('allocation.site', 'allocation-sites', buildMockCallSites(bytes, Date.now() - capture.startedAt)),
+    ],
+  });
+
+  // The host copies the capture out of the container after the collector has closed and analysed
+  // it, and only then reports the session stopped. Reproducing that gap is what makes the rail's
+  // "still being copied out" state reviewable in a browser; the generation guard keeps a slow
+  // copy-out from an old session from landing on a new one.
+  setTimeout(() => {
+    if (generation !== mockGeneration) return;
+
+    // The host's copy-out answer, mirroring the real one: a success message carries the local
+    // path, and a failure names the container that still holds the file.
+    if (MOCK_CAPTURE_LOST) {
+      handlers?.messages({
+        sessionId: SESSION_ID,
+        messages: [
+          envelope('capture.copyFailed', null, {
+            container: 'orders-api',
+            remote: capture.path,
+            error: `docker cp orders-api:${capture.path} failed: permission denied`,
+          }),
+        ],
+      });
+    } else if (capture.copiedTo) {
+      handlers?.messages({
+        sessionId: SESSION_ID,
+        messages: [
+          envelope('capture.copied', null, {
+            path: capture.copiedTo,
+            bytes,
+            container: 'orders-api',
+            remote: capture.path,
+          }),
+        ],
+      });
+    }
+
+    reportStopped();
+  }, 1200);
 }
 
 const MOCK_TARGET_PID = 4242;
@@ -1003,13 +1149,49 @@ export const mockApi = {
   }),
   refreshCollector: async () => COLLECTOR,
   listProcesses: async () => PROCESSES,
+  // The mock always "has" Docker: the section only renders when the host reports it, and
+  // pretending it is missing would leave the one view that needs container data unreviewable in
+  // `?mock=1`. `?mock=1&docker=down` reviews the other state — installed but stopped.
+  dockerStatus: async (): Promise<DockerStatus> =>
+    MOCK_DOCKER_DOWN
+      ? {
+          available: false,
+          version: null,
+          stagedRids: [],
+          problem: 'daemonUnreachable',
+          error:
+            'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?',
+        }
+      : {
+          available: true,
+          version: '29.8.1',
+          stagedRids: ['linux-arm64'],
+          problem: null,
+          error: null,
+        },
+  listDockerContainers: async (): Promise<DockerContainer[]> =>
+    MOCK_DOCKER_DOWN ? [] : DOCKER_CONTAINERS,
+  listContainerProcesses: async (container: string): Promise<DotnetProcessInfo[]> =>
+    CONTAINER_PROCESSES[container] ?? [],
   getCapabilities: async () => CAPABILITIES,
   // The request is honoured where it is observable: a session that was asked to record gets
   // the same `recording` field back that the real host returns, so the rail and the library
   // behave identically against the mock.
   startSession: async (request: SessionRequest): Promise<SessionSnapshot> => {
+    // A container capture is written inside the container first — the collector can only name
+    // that path — and the host's copy-out is what turns it into a local file. A host session's
+    // capture is local from the start, which is why `?mock=1&capture=lost` is reachable from
+    // either attach: the flag rehearses the container failure on purpose.
+    const containerised = Boolean(request.container?.trim()) || MOCK_CAPTURE_LOST;
     const snapshot = beginMockSession(
-      request.deepCapture ? '/mock/recordings/capture-4242.nettrace' : null,
+      request.deepCapture
+        ? containerised
+          ? '/tmp/capture-4242.nettrace'
+          : '/mock/recordings/capture-4242.nettrace'
+        : null,
+      request.deepCapture && containerised && !MOCK_CAPTURE_LOST
+        ? '/mock/recordings/capture-4242.nettrace'
+        : null,
     );
     if (!request.record && !request.recordPath) return snapshot;
     return { ...snapshot, recording: openMockRecording(request.targetName ?? 'process') };
@@ -1076,6 +1258,14 @@ export const mockApi = {
   listRecordings: async (): Promise<RecordingSummary[]> => mockRecordings,
   deleteRecording: async (path: string) => {
     mockRecordings = mockRecordings.filter((recording) => recording.path !== path);
+  },
+  // Mirrors the host's answer in `src-tauri/src/reveal.rs`, including its wording: the rail and
+  // the recordings library show whatever the host returns, so a browser can only review that
+  // text if the mock produces the same one.
+  revealInFolder: async (path: string): Promise<void> => {
+    if (MOCK_REVEAL_MISSING) {
+      throw new Error(`The file is no longer at ${path} — it has been moved or deleted.`);
+    }
   },
   startPlayback: async (path: string, speed?: number): Promise<PlaybackStatusEvent> => {
     const recording =

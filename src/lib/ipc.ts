@@ -6,6 +6,8 @@ import type {
   Capabilities,
   CollectorMessage,
   CollectorLocation,
+  DockerContainer,
+  DockerStatus,
   DotnetProcessInfo,
   EnvironmentInfo,
   PlaybackStatusEvent,
@@ -61,6 +63,12 @@ const realApi = {
   getEnvironment: () => call<EnvironmentInfo>('get_environment'),
   refreshCollector: () => call<CollectorLocation>('refresh_collector'),
   listProcesses: (fast = false) => call<DotnetProcessInfo[]>('list_processes', { fast }),
+  // Containerised targets. Discovery is a separate call because staging the Linux collector into
+  // a container is real work and must not ride on the five-second process-list refresh.
+  dockerStatus: () => call<DockerStatus>('get_docker_status'),
+  listDockerContainers: () => call<DockerContainer[]>('list_docker_containers'),
+  listContainerProcesses: (container: string) =>
+    call<DotnetProcessInfo[]>('list_container_processes', { container }),
   getCapabilities: () => call<Capabilities>('get_capabilities'),
   startSession: (request: SessionRequest) => call<SessionSnapshot>('start_session', { request }),
   stopSession: (sessionId: string) => call<void>('stop_session', { sessionId }),
@@ -80,6 +88,9 @@ const realApi = {
   // Recordings on disk.
   listRecordings: () => call<RecordingSummary[]>('list_recordings'),
   deleteRecording: (path: string) => call<void>('delete_recording', { path }),
+  // The webview cannot open a file manager, so a printed path is only reachable through the
+  // host. Rejects with the host's wording when the file is no longer there.
+  revealInFolder: (path: string) => call<void>('reveal_in_folder', { path }),
 
   // Replaying one offline.
   startPlayback: (path: string, speed?: number) =>

@@ -362,6 +362,7 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
 
 .rail-head .eyebrow {
@@ -403,6 +404,19 @@ code {
 .process-row.is-attached {
   border-color: var(--amber);
   background: rgba(242, 169, 59, 0.07);
+}
+
+.container-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* A container's processes are indented: they are targets *inside* the row above, not siblings
+   of it, and the rail has no second level of hierarchy to say so otherwise. */
+.process-row-nested {
+  margin-left: 10px;
+  background: var(--ink-750);
 }
 
 .process-row-top {
@@ -464,6 +478,28 @@ code {
 
 .attached-detail {
   margin: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* The target of the last session: one click back into a process, or an honest reason why not. */
+.rail-resume {
+  background: rgba(242, 169, 59, 0.04);
+}
+
+.resume-target {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+}
+
+.resume-name {
+  font-weight: 600;
+}
+
+.resume-detail {
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--text-dim);
@@ -1934,14 +1970,80 @@ code {
   color: var(--text-dim);
 }
 
+.rail-note-warn {
+  color: var(--amber);
+}
+
+/* The daemon's own message, verbatim: it is the most specific thing the rail can say, and it must
+   wrap at its spaces rather than mid-token (a Unix socket path broken into "uni x" reads as a bug). */
+.rail-note-detail {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
 .rail-note code {
   font-family: var(--font-mono);
   word-break: break-all;
 }
 
+/*
+ * The capture path and its reveal control share a row so the button reads as an action on that
+ * file. The code yields and the button keeps its width, because a wrapped "Show in Finder"
+ * label is worse than a broken path.
+ */
+.capture-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.capture-path code {
+  flex: 1 1 140px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.capture-path .btn {
+  flex: 0 0 auto;
+}
+
+/* A failure note pushed under the path rather than squeezed in beside it. */
+.reveal-error {
+  margin-top: 6px;
+}
+
+.capture-path .reveal-error {
+  flex: 1 0 100%;
+  margin-top: 0;
+}
+
+/* On its own line under a rail note, but flush inside a row that already spaces its items. */
+.rail .reveal-button {
+  margin-top: 6px;
+}
+
+.capture-path .reveal-button {
+  margin-top: 0;
+}
+
 .tag-live {
   border-color: rgba(95, 191, 143, 0.45);
   color: var(--good);
+}
+
+/* The target the last session was attached to: a quiet marker, not a call to action — starting a
+   session is still the user's decision, so this only helps them find the row again. */
+.tag-last {
+  border-color: rgba(242, 169, 59, 0.35);
+  color: var(--amber);
 }
 
 .tag-warn {

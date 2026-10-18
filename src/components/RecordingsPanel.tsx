@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { formatAge, formatBytes, formatDuration } from '../lib/format';
 import { api } from '../lib/ipc';
 import type { RecordingSummary } from '../lib/types';
+import { RevealFileButton } from './RevealFileButton';
 
 interface Props {
   recordingsDir: string;
@@ -177,6 +178,9 @@ export function RecordingsPanel({
                   >
                     {isActive ? 'Playing' : 'Replay'}
                   </button>
+                  {/* Works on a broken or half-written file too: it is a filesystem action,
+                      and "where is this file?" is exactly the question a bad row raises. */}
+                  <RevealFileButton path={recording.path} onError={setError} />
                   <button
                     type="button"
                     className="btn btn-sm btn-ghost"

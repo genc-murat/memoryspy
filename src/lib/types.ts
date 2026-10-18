@@ -269,6 +269,39 @@ export interface TargetExitedData {
   capture?: { path: string; bytes: number; truncated: boolean } | null;
 }
 
+/**
+ * Sent by the host — not the collector — after a capture written inside a container has been
+ * copied onto this machine.
+ *
+ * The collector can only report the path it wrote; for a container target that path is inside
+ * the container and stops existing when it is removed. This message carries the path the user
+ * can actually open, which is what the UI should show from then on.
+ */
+export interface CaptureCopiedData {
+  /** Where the capture is now: a path on this machine. */
+  path: string;
+  bytes: number;
+  /** The container it was copied out of. */
+  container?: string | null;
+  /** Where it lived while the collector was writing it, inside that container. */
+  remote?: string | null;
+}
+
+/**
+ * Sent by the host when the copy-out failed, which leaves the capture inside the container.
+ *
+ * The collector's path is then the only path there is, so the UI has to say loudly that it is
+ * a container path — without this the rail would present `/tmp/…` as a file on this machine.
+ */
+export interface CaptureCopyFailedData {
+  /** The container the file is still in. */
+  container: string;
+  /** Where inside it the file remains. */
+  remote: string;
+  /** The Docker CLI's own reason, shown verbatim. */
+  error: string;
+}
+
 // ---------------------------------------------------------------------------------------
 // Allocation call sites (deep capture)
 // ---------------------------------------------------------------------------------------
@@ -405,6 +438,29 @@ export interface DotnetProcessInfo {
   workingSetBytes?: number | null;
   privateBytes?: number | null;
   startTimeUnixMs?: number | null;
+}
+
+/** Whether containerised targets can be inspected, and why not when they cannot. */
+export interface DockerStatus {
+  available: boolean;
+  version?: string | null;
+  /** Which Linux collectors are published; empty means `npm run collector:docker` is needed. */
+  stagedRids: string[];
+  error?: string | null;
+  /**
+   * Why the daemon cannot be used, when it cannot. `cliMissing` means this machine has no Docker
+   * at all (nothing to show); `daemonUnreachable` means Docker is installed and stopped, which the
+   * rail explains instead of hiding the section.
+   */
+  problem?: 'cliMissing' | 'daemonUnreachable' | null;
+}
+
+/** A running container the rail can expand into its attachable processes. */
+export interface DockerContainer {
+  id: string;
+  name: string;
+  image: string;
+  status: string;
 }
 
 export interface CollectorLocation {
@@ -565,4 +621,6 @@ export interface SessionRequest {
   /** Target metadata for the recording header and file name. */
   targetName?: string | null;
   targetRuntime?: string | null;
+  /** Name or id of a Docker container the target runs in; omitted means a local process. */
+  container?: string | null;
 }

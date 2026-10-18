@@ -49,6 +49,13 @@ jobs:
       - name: Publish the collector into the bundle resources
         run: npm run collector:publish
 
+      # A container target is profiled by the Linux collector copied into the container, so a
+      # release that offers the Containers section has to carry it too. Only one RID is shipped:
+      # each is a self-contained ~80 MB single file inside the installer, and the Windows x64
+      # installer is the only artifact this workflow builds.
+      - name: Publish the Linux collector for container targets
+        run: npm run collector:docker -- linux-x64
+
       # `beforeBuildCommand` runs `npm run build` (tsc + vite) itself; on Windows this
       # produces the NSIS setup and the MSI under src-tauri/target/release/bundle.
       - name: Build the app

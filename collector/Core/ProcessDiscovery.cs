@@ -34,7 +34,13 @@ public static class ProcessDiscovery
         int[] pids;
         try
         {
-            pids = DiagnosticsClient.GetPublishedProcesses().Distinct().OrderBy(p => p).ToArray();
+            pids = DiagnosticsClient.GetPublishedProcesses()
+                // The collector publishes a diagnostics endpoint like any other .NET process, so
+                // it would list itself as an attachable target. It is the tool, never a target.
+                .Where(pid => pid != Environment.ProcessId)
+                .Distinct()
+                .OrderBy(p => p)
+                .ToArray();
         }
         catch
         {

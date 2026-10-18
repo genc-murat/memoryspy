@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using MemorySpy.Collector.Core;
@@ -28,6 +29,25 @@ if (args.Length == 0 || args[0] is "--help" or "-h" or "help")
 
 switch (args[0])
 {
+    case "version":
+    {
+        Console.WriteLine(CollectorIdentity());
+        return 0;
+    }
+
+    case "cleanup":
+    {
+        if (args.Length != 2 || !args[1].StartsWith("memoryspy-collector-", StringComparison.Ordinal)
+            || args[1].Any(character => !char.IsAsciiLetterOrDigit(character) && character != '-'))
+        {
+            emitter.Error("cleanup requires a MemorySpy collector filename prefix.");
+            return 1;
+        }
+
+        CleanupCollectors(args[1]);
+        return 0;
+    }
+
     case "capabilities":
     {
         emitter.Emit(MessageType.Hello, null, BuildCapabilities());
@@ -254,6 +274,32 @@ int RunWatch(string[] argv)
     return exitCode;
 }
 
+static string CollectorIdentity()
+{
+    var executable = Environment.ProcessPath
+        ?? throw new InvalidOperationException("The collector executable path is unavailable.");
+    using var stream = File.OpenRead(executable);
+    return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+}
+
+static void CleanupCollectors(string prefix)
+{
+    var current = Path.GetFullPath(Environment.ProcessPath
+        ?? throw new InvalidOperationException("The collector executable path is unavailable."));
+    var tempDirectory = Path.GetFullPath(Path.GetTempPath());
+
+    foreach (var path in Directory.EnumerateFiles(tempDirectory, $"{prefix}*"))
+    {
+        // Remove copies older than one day, leaving time for another attach to finish copying
+        // or start executing the same content-addressed binary before this process prunes it.
+        if (!string.Equals(Path.GetFullPath(path), current, StringComparison.Ordinal)
+            && DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromDays(1))
+        {
+            File.Delete(path);
+        }
+    }
+}
+
 static IDisposable? RegisterSignal(PosixSignal signal, CollectorSession session)
 {
     try
@@ -276,7 +322,16 @@ static void ListenForCommands(CollectorSession session, IReadOnlyList<ICollector
     {
         var line = Console.In.ReadLine();
         if (line is null)
-            return; // stdin closed: the host is gone.
+        {
+            // stdin is not only the command channel, it is the liveness signal of the host.
+            // Reaching EOF here means the host is gone — a killed `docker exec` client closes
+            // the pipe, and without this the collector would keep an EventPipe session attached
+            // to a target nobody is watching. Verified against a container: an exec whose stdin
+            // was at EOF left the collector running until it was killed by hand.
+            emitter.Log("warn", "stdin closed; the host is gone, stopping the session.");
+            session.RequestStop();
+            return;
+        }
 
         line = line.Trim();
         if (line.Length == 0)

@@ -4,19 +4,20 @@
 //! enumeration, capability probing and spawning a child process all involve IO that would
 //! otherwise stall the webview's message loop and make the window feel frozen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
-
 use std::sync::Arc;
 
 use crate::collector::{
-    self, CollectorLocation, DotnetProcessInfo, EventSink, SessionHandle, SessionRequest, SessionState,
+    self, CollectorLocation, DotnetProcessInfo, EventSink, SessionHandle, SessionRequest,
+    SessionState,
 };
+use crate::docker::{self, DockerContainer, DockerStatus};
 use crate::recording::{self, PlaybackHandle, RecordingSummary};
 use crate::settings::{self, Settings};
 
@@ -25,9 +26,60 @@ use crate::settings::{self, Settings};
 pub struct AppState {
     pub location: Mutex<CollectorLocation>,
     pub sessions: Mutex<HashMap<String, SessionHandle>>,
+    starting_sessions: Mutex<HashSet<SessionTarget>>,
     pub playbacks: Mutex<HashMap<String, PlaybackHandle>>,
     pub settings: Mutex<Settings>,
     pub sink: Arc<dyn EventSink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionTarget {
+    pid: i32,
+    container: Option<String>,
+}
+
+impl SessionTarget {
+    fn description(&self) -> String {
+        match &self.container {
+            Some(container) => format!("process {} in container {container}", self.pid),
+            None => format!("process {}", self.pid),
+        }
+    }
+}
+
+/// Reserves a target while its collector is being prepared and launched.
+///
+/// The reservation is deliberately separate from the live session map: Docker staging can take
+/// minutes, and holding the map lock throughout would block detach, prune, and UI snapshots.
+struct SessionStartReservation<'a> {
+    starting_sessions: &'a Mutex<HashSet<SessionTarget>>,
+    target: SessionTarget,
+}
+
+impl Drop for SessionStartReservation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut starting) = self.starting_sessions.lock() {
+            starting.remove(&self.target);
+        }
+    }
+}
+
+fn reserve_target<'a>(
+    starting_sessions: &'a Mutex<HashSet<SessionTarget>>,
+    target: SessionTarget,
+) -> Result<SessionStartReservation<'a>, String> {
+    let mut starting = starting_sessions.lock().unwrap();
+    if !starting.insert(target.clone()) {
+        return Err(format!(
+            "Already attaching to {}. Detach first.",
+            target.description()
+        ));
+    }
+
+    Ok(SessionStartReservation {
+        starting_sessions,
+        target,
+    })
 }
 
 impl AppState {
@@ -35,6 +87,7 @@ impl AppState {
         Self {
             location: Mutex::new(location),
             sessions: Mutex::new(HashMap::new()),
+            starting_sessions: Mutex::new(HashSet::new()),
             playbacks: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings),
             sink,
@@ -43,6 +96,31 @@ impl AppState {
 
     pub fn location_snapshot(&self) -> CollectorLocation {
         self.location.lock().unwrap().clone()
+    }
+
+    /// Reserves one process/container pair and rejects an already active or starting target.
+    fn reserve_session_start(
+        &self,
+        target: SessionTarget,
+    ) -> Result<SessionStartReservation<'_>, String> {
+        let reservation = reserve_target(&self.starting_sessions, target.clone())?;
+        let already_active = self.sessions.lock().unwrap().values().any(|session| {
+            session.pid() == target.pid
+                && session.container() == target.container.as_deref()
+                && matches!(
+                    session.state(),
+                    SessionState::Starting | SessionState::Running | SessionState::Stopping
+                )
+        });
+
+        if already_active {
+            return Err(format!(
+                "Already attached to {}. Detach first.",
+                target.description()
+            ));
+        }
+
+        Ok(reservation)
     }
 
     /// The live session asked for, or a readable error.
@@ -67,7 +145,8 @@ impl AppState {
 
     /// Stops every replay, e.g. before the window closes.
     pub fn stop_playbacks(&self) {
-        let handles: Vec<PlaybackHandle> = self.playbacks.lock().unwrap().values().cloned().collect();
+        let handles: Vec<PlaybackHandle> =
+            self.playbacks.lock().unwrap().values().cloned().collect();
         for handle in handles {
             handle.stop();
         }
@@ -133,10 +212,42 @@ pub async fn refresh_collector(state: State<'_, AppState>) -> Result<CollectorLo
 }
 
 #[tauri::command]
-pub async fn list_processes(state: State<'_, AppState>, fast: Option<bool>) -> Result<Vec<DotnetProcessInfo>, String> {
+pub async fn list_processes(
+    state: State<'_, AppState>,
+    fast: Option<bool>,
+) -> Result<Vec<DotnetProcessInfo>, String> {
     let location = state.location_snapshot();
 
-    tauri::async_runtime::spawn_blocking(move || collector::list_processes(&location, fast.unwrap_or(false)))
+    tauri::async_runtime::spawn_blocking(move || {
+        collector::list_processes(&location, fast.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Whether containerised targets can be inspected at all, and why not when they cannot.
+#[tauri::command]
+pub async fn get_docker_status() -> Result<DockerStatus, String> {
+    tauri::async_runtime::spawn_blocking(docker::status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Running containers, which are the only targets the Docker transport can attach to.
+#[tauri::command]
+pub async fn list_docker_containers() -> Result<Vec<DockerContainer>, String> {
+    tauri::async_runtime::spawn_blocking(docker::list_containers)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The attachable .NET processes inside one container.
+///
+/// This stages the Linux collector into the container on first use, which is why it is a
+/// command of its own rather than part of the process list the rail refreshes every few seconds.
+#[tauri::command]
+pub async fn list_container_processes(container: String) -> Result<Vec<DotnetProcessInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || docker::list_processes(&container))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -158,7 +269,18 @@ pub async fn start_session(
 ) -> Result<Value, String> {
     let location = state.location_snapshot();
 
-    if !location.found {
+    // Normalised once: an empty string is not a container, and every later decision (the host
+    // collector check, the session identity, the capture location) has to agree on that.
+    let request_container = request
+        .container
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    // A container session runs the Linux collector *inside* the container, so it does not need
+    // the host build at all: a machine whose host collector is missing can still profile one.
+    if !location.found && request_container.is_none() {
         return Err(location
             .error
             .clone()
@@ -167,27 +289,23 @@ pub async fn start_session(
 
     // A live session and a replay both feed the same store, so running one over the other
     // would splice two timelines into a single set of charts.
-    if state.playbacks.lock().unwrap().values().any(|handle| handle.is_active()) {
+    if state
+        .playbacks
+        .lock()
+        .unwrap()
+        .values()
+        .any(|handle| handle.is_active())
+    {
         return Err("Stop the replay before attaching to a process.".to_string());
     }
 
-    // One session per target process. Attaching twice would double the EventPipe load on
-    // the target and produce two interleaved series for the same counters.
-    {
-        let sessions = state.sessions.lock().unwrap();
-        if let Some(existing) = sessions.values().find(|s| s.pid() == request.pid) {
-            let active = matches!(
-                existing.state(),
-                SessionState::Starting | SessionState::Running | SessionState::Stopping
-            );
-            if active {
-                return Err(format!(
-                    "Already attached to process {}. Detach first.",
-                    request.pid
-                ));
-            }
-        }
-    }
+    // One session per target process. Reserve before staging or launching: those operations can
+    // block long enough for a second invocation to race through a plain sessions-map check.
+    // A pid is only unique within its process namespace, so the container is part of the key.
+    let _reservation = state.reserve_session_start(SessionTarget {
+        pid: request.pid,
+        container: request_container.clone(),
+    })?;
 
     let pid = request.pid;
     let label = request.target_name.clone();
@@ -195,7 +313,8 @@ pub async fn start_session(
     // Only resolved when a recording or a deep capture is actually requested, so attaching does
     // not create an empty folder as a side effect. A deep capture writes its .nettrace here too:
     // it is the folder the app owns, shows, and lets the user clean up.
-    let recordings_dir = if request.record || request.record_path.is_some() || request.deep_capture {
+    let recordings_dir = if request.record || request.record_path.is_some() || request.deep_capture
+    {
         Some(recording::recordings_dir(&app)?)
     } else {
         None
@@ -321,6 +440,18 @@ pub async fn stop_recording(
 // Recordings on disk
 // ---------------------------------------------------------------------------------------
 
+/// Shows a recording or capture in Finder, Explorer or the desktop's file manager.
+///
+/// The webview cannot launch applications, so a path it prints is a dead end without this.
+/// The missing-file case is answered here rather than by the launcher: only the host can say
+/// "the capture was moved or deleted" in wording the rail can put next to the path.
+#[tauri::command]
+pub async fn reveal_in_folder(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::reveal::reveal(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn list_recordings(app: AppHandle) -> Result<Vec<RecordingSummary>, String> {
     let dir = recording::recordings_dir(&app)?;
@@ -362,13 +493,11 @@ pub async fn delete_recording(
         return Err("Stop the replay before deleting this recording.".into());
     }
 
-    if state
-        .sessions
-        .lock()
-        .unwrap()
-        .values()
-        .any(|handle| handle.recording().is_some_and(|recording| is_open(&recording.path)))
-    {
+    if state.sessions.lock().unwrap().values().any(|handle| {
+        handle
+            .recording()
+            .is_some_and(|recording| is_open(&recording.path))
+    }) {
         return Err("Stop recording before deleting this file.".into());
     }
 
@@ -405,7 +534,11 @@ pub async fn start_playback(
 
     // Clicking Replay on another file should not require stopping the first one by hand.
     state.stop_playbacks();
-    state.playbacks.lock().unwrap().retain(|_, handle| handle.is_active());
+    state
+        .playbacks
+        .lock()
+        .unwrap()
+        .retain(|_, handle| handle.is_active());
 
     let sink = state.sink.clone();
     let recording_path = Path::new(&path).to_path_buf();
@@ -432,7 +565,10 @@ pub async fn pause_playback(state: State<'_, AppState>, playback_id: String) -> 
 }
 
 #[tauri::command]
-pub async fn resume_playback(state: State<'_, AppState>, playback_id: String) -> Result<(), String> {
+pub async fn resume_playback(
+    state: State<'_, AppState>,
+    playback_id: String,
+) -> Result<(), String> {
     state.playback(&playback_id)?.resume()
 }
 
@@ -474,6 +610,53 @@ pub async fn save_settings(
     let saved = settings::save(&app, settings)?;
     *state.settings.lock().unwrap() = saved.clone();
     Ok(saved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn concurrent_starts_cannot_reserve_the_same_target() {
+        let starts = Arc::new(Mutex::new(HashSet::new()));
+        let barrier = Arc::new(Barrier::new(3));
+        let target = SessionTarget {
+            pid: 4242,
+            container: Some("service".to_string()),
+        };
+
+        let results = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let starts = Arc::clone(&starts);
+                let barrier = Arc::clone(&barrier);
+                let target = target.clone();
+                workers.push(scope.spawn(move || {
+                    let reservation = reserve_target(&starts, target);
+                    barrier.wait();
+                    reservation.is_ok()
+                }));
+            }
+
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("reservation worker must not panic"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results.iter().filter(|reserved| **reserved).count(),
+            1,
+            "exactly one concurrent attach should reserve a target"
+        );
+        assert!(
+            starts.lock().unwrap().is_empty(),
+            "the reservation must be released after the start attempt finishes"
+        );
+    }
 }
 
 fn now_unix_ms() -> u64 {

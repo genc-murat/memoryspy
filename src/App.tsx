@@ -7,10 +7,14 @@ import { diagnose } from './lib/analysis';
 import { formatBytes, formatDuration } from './lib/format';
 import { api, isBackendAvailable, MOCK_ENABLED, onLog, onMessages, onPlayback, onStatus } from './lib/ipc';
 import { severityColor } from './lib/palette';
+import { loadRailState, patchRailState, type LastTarget } from './lib/railState';
 import { MetricsStore } from './lib/store';
+import { loadViewState, patchViewState, type ViewState } from './lib/viewState';
 import type {
   Capabilities,
   CollectorLocation,
+  DockerContainer,
+  DockerStatus,
   DotnetProcessInfo,
   PlaybackStatusEvent,
   RecordingSummary,
@@ -55,6 +59,16 @@ const REPLAY_LABEL: Record<PlaybackStatusEvent['state'], string> = {
   failed: 'Replay failed',
 };
 
+/**
+ * How often the open container lists are re-read while the rail is idle.
+ *
+ * Slower than the host process list's 5 s on purpose: each tick shells out to the Docker CLI
+ * (inspecting the image and probing the staged collector before it can list), which is far more
+ * expensive than reading the local process list. Ten seconds is still well inside "the service I
+ * just restarted is back" for someone watching the rail.
+ */
+const CONTAINER_REFRESH_MS = 10_000;
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -70,10 +84,51 @@ export function App() {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [processes, setProcesses] = useState<DotnetProcessInfo[]>([]);
   const [loadingProcesses, setLoadingProcesses] = useState(false);
+  const [docker, setDocker] = useState<DockerStatus | null>(null);
+  const [containers, setContainers] = useState<DockerContainer[]>([]);
+  const [containerProcesses, setContainerProcesses] = useState<Record<string, DotnetProcessInfo[]>>({});
+  /**
+   * Containers whose process list is open in the rail.
+   *
+   * Kept apart from the list itself so the list can be refreshed without closing it — the
+   * expanded set is what survives a session ending or a rescan.
+   */
+  const [expandedContainers, setExpandedContainers] = useState<string[]>(
+    () => loadRailState().expandedContainers,
+  );
+  /** The target the last session was attached to, restored across restarts as a marker. */
+  const [lastTarget, setLastTarget] = useState<LastTarget | null>(() => loadRailState().lastTarget);
+  /** A resume is checking whether the remembered target still exists. */
+  const [resuming, setResuming] = useState(false);
+  /** Why the remembered target cannot be resumed, shown next to the button. */
+  const [resumeNote, setResumeNote] = useState<string | null>(null);
+  /** Containers currently being staged/listed; several can be in flight during a refresh. */
+  const [containerBusy, setContainerBusy] = useState<string[]>([]);
+  const [containerError, setContainerError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [attachedPid, setAttachedPid] = useState<number | null>(null);
+  /** The container the attached target runs in; `null` for a process on this machine. */
+  const [attachedContainer, setAttachedContainer] = useState<string | null>(null);
   const [selectedProbes, setSelectedProbes] = useState<string[]>([]);
-  const [activePanel, setActivePanel] = useState('overview');
+
+  /**
+   * The tab and per-tab scroll offsets this window had when it was last closed.
+   *
+   * Read once per page load, not on every render: the stored value is only the starting point,
+   * and the live refs below are the truth from then on.
+   */
+  const restoredViewRef = useRef<ViewState | null>(null);
+  if (restoredViewRef.current === null) restoredViewRef.current = loadViewState();
+  const restoredView = restoredViewRef.current;
+
+  const [activePanel, setActivePanel] = useState(restoredView.panel);
+  /** The element every tab renders into; its scroll offset is the one that is remembered. */
+  const mainScrollRef = useRef<HTMLDivElement | null>(null);
+  /** Latest offset per tab, updated on every scroll so a tab switch can put it back. */
+  const scrollTopsRef = useRef<Record<string, number>>(restoredView.scrollTops);
+  const activePanelRef = useRef(activePanel);
+  /** True while an offset is being re-applied, so that clamped intermediate values are not saved. */
+  const restoringScrollRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const [playback, setPlayback] = useState<PlaybackStatusEvent | null>(null);
@@ -90,9 +145,36 @@ export function App() {
   // stale closure would miss the second one's generation change.
   const playbackRef = useRef<PlaybackStatusEvent | null>(null);
 
+  // The event subscriptions are registered once, so a terminal session status has to read the
+  // expanded set from a ref rather than from the render that installed the handler.
+  // Seeded from the restored layout, so the startup pass can read it before any toggle happens.
+  const expandedContainersRef = useRef<string[]>(expandedContainers);
+  useEffect(() => {
+    expandedContainersRef.current = expandedContainers;
+  }, [expandedContainers]);
+
+  // The busy set has the same problem as the expanded set: a tick and a click in the same frame
+  // must see each other's decision, so the guard reads a ref rather than the last render.
+  const containerBusyRef = useRef<string[]>([]);
+
   const sessionState: SessionState | 'idle' = store.session.state;
   const replayActive = playback !== null && playback.state !== 'finished' && playback.state !== 'stopped' && playback.state !== 'failed';
-  const attachedProcess = processes.find((process_) => process_.pid === attachedPid) ?? null;
+
+  // A pid is only meaningful together with its container, so the attached row is looked up in the
+  // right list rather than in whichever list happens to share the number.
+  const attachedProcess = useMemo(() => {
+    if (attachedPid == null) return null;
+    if (attachedContainer) {
+      // A pid is only unique inside its container. Looking the pid up across every expanded
+      // container would show whichever one came first — usually the wrong one, since a service
+      // normally runs as pid 1.
+      return (
+        containerProcesses[attachedContainer]?.find((process_) => process_.pid === attachedPid) ??
+        null
+      );
+    }
+    return processes.find((process_) => process_.pid === attachedPid) ?? null;
+  }, [attachedContainer, attachedPid, containerProcesses, processes]);
 
   // ---- Startup ------------------------------------------------------------------------
 
@@ -127,6 +209,14 @@ export function App() {
         );
 
         await refreshProcesses(probes !== null);
+        const containerNames = await refreshContainers();
+
+        // Containers that were open last time are restored, and their process lists are read now:
+        // an expanded row with nothing under it would look like a listing that failed. Only the
+        // ones that still exist are asked about — with Docker down there is nothing to list.
+        await refreshContainerProcesses(
+          expandedContainersRef.current.filter((name) => containerNames.includes(name)),
+        );
       } catch (startupError) {
         if (!cancelled) setError(messageOf(startupError));
       }
@@ -152,6 +242,138 @@ export function App() {
     }
   }, []);
 
+  /**
+   * Reads whether containers can be inspected at all, then lists the running ones.
+   *
+   * Deliberately not part of the five-second process refresh: this spawns the Docker CLI, and
+   * the result only changes when the user starts or stops a container. Returns the names that
+   * exist now, so a caller refreshing their process lists does not ask about one that is gone.
+   */
+  const refreshContainers = useCallback(async (): Promise<string[]> => {
+    try {
+      const status = await api.dockerStatus();
+      setDocker(status);
+      if (!status.available) {
+        setContainers([]);
+        setContainerProcesses({});
+        // The saved layout is deliberately kept: Docker being down when the app starts (Docker
+        // Desktop still booting) must not erase which containers were open. The next successful
+        // listing prunes the names that are really gone.
+        return [];
+      }
+
+      const list = await api.listDockerContainers();
+      setContainers(list);
+      const names = list.map((container) => container.name);
+
+      // A container stopped while the rail was open must not stay expanded, and its cached
+      // process list would describe a target that no longer exists. The pruned layout is what
+      // the next launch restores, so it is written back rather than only held in state.
+      const kept = expandedContainersRef.current.filter((name) => names.includes(name));
+      expandedContainersRef.current = kept;
+      setExpandedContainers(kept);
+      patchRailState({ expandedContainers: kept });
+      setContainerProcesses((current) => {
+        const next: Record<string, DotnetProcessInfo[]> = {};
+        for (const [name, processes] of Object.entries(current)) {
+          if (names.includes(name)) next[name] = processes;
+        }
+        return next;
+      });
+
+      setContainerError(null);
+      return names;
+    } catch (dockerError) {
+      setContainerError(messageOf(dockerError));
+      return [];
+    }
+  }, []);
+
+  /**
+   * Lists one container's attachable processes, leaving whether it is expanded alone.
+   *
+   * The first listing stages the Linux collector into the container (an 80 MB copy, once), which
+   * is why the row shows a busy state instead of doing this silently in the background.
+   */
+  const listContainerProcesses = useCallback(
+    async (container: string, quiet = false): Promise<DotnetProcessInfo[] | null> => {
+      // A listing already in flight for this container wins: a periodic tick must not stack on
+      // top of it, and a double click must not become two `docker exec` calls.
+      if (containerBusyRef.current.includes(container)) return null;
+
+      containerBusyRef.current = [...containerBusyRef.current, container];
+      setContainerBusy(containerBusyRef.current);
+
+      try {
+        const list = await api.listContainerProcesses(container);
+        setContainerProcesses((current) => ({ ...current, [container]: list }));
+        return list;
+      } catch (inspectError) {
+        // A background refresh is silent on purpose: the next tick retries, and a transient
+        // failure must not put an error in the rail that nobody asked for.
+        if (!quiet) {
+          const message = messageOf(inspectError);
+          setContainerError(message);
+          store.addHostLog('error', message);
+        }
+        return null;
+      } finally {
+        containerBusyRef.current = containerBusyRef.current.filter((name) => name !== container);
+        setContainerBusy(containerBusyRef.current);
+      }
+    },
+    [store],
+  );
+
+  /**
+   * Re-lists the process lists that are on screen.
+   *
+   * Parallel on purpose: waiting for one slow container before starting the next makes a refresh
+   * look stuck, and each row reports its own busy state anyway.
+   */
+  const refreshContainerProcesses = useCallback(
+    async (names: string[], quiet = false) => {
+      await Promise.all(names.map((name) => listContainerProcesses(name, quiet)));
+    },
+    [listContainerProcesses],
+  );
+
+  /** Expands a container (listing its processes) or collapses it again. */
+  const toggleContainer = useCallback(
+    (container: string) => {
+      // The ref is updated eagerly so two clicks in one frame cannot both decide "expand": the
+      // second one sees the state the first one just wrote.
+      const expanded = expandedContainersRef.current.includes(container);
+      const next = expanded
+        ? expandedContainersRef.current.filter((name) => name !== container)
+        : [...expandedContainersRef.current, container];
+
+      expandedContainersRef.current = next;
+      setExpandedContainers(next);
+      patchRailState({ expandedContainers: next });
+
+      if (!expanded) {
+        setContainerError(null);
+        void listContainerProcesses(container);
+      }
+    },
+    [listContainerProcesses],
+  );
+
+  /** Refreshes the container list and the processes of every container still open. */
+  const refreshDocker = useCallback(async () => {
+    const names = await refreshContainers();
+    await refreshContainerProcesses(
+      expandedContainersRef.current.filter((name) => names.includes(name)),
+    );
+  }, [refreshContainers, refreshContainerProcesses]);
+
+  /** The rail's Rescan: local processes and containers, both brought up to date. */
+  const refreshAll = useCallback(async () => {
+    await refreshProcesses();
+    await refreshDocker();
+  }, [refreshProcesses, refreshDocker]);
+
   // Keep the process list fresh while nothing is attached, so a restarted service reappears
   // without the user having to press Rescan.
   useEffect(() => {
@@ -160,11 +382,146 @@ export function App() {
     return () => clearInterval(timer);
   }, [sessionState, refreshProcesses]);
 
+  // The same for the containers that are open, so a service restarted *inside* one shows its new
+  // pid without a manual Refresh. Off while attached, and off when no Linux collector has been
+  // published: in that case every tick could only repeat an error the user has to fix once.
+  useEffect(() => {
+    if (sessionState === 'running' || sessionState === 'starting') return;
+    if (expandedContainers.length === 0) return;
+    if (!docker?.available || docker.stagedRids.length === 0) return;
+
+    const timer = setInterval(() => {
+      void refreshContainerProcesses(expandedContainersRef.current, true);
+    }, CONTAINER_REFRESH_MS);
+
+    return () => clearInterval(timer);
+  }, [
+    docker?.available,
+    docker?.stagedRids.length,
+    expandedContainers.length,
+    sessionState,
+    refreshContainerProcesses,
+  ]);
+
   // Persist the detail so a support request or a bug report carries the mode with it.
   useEffect(() => {
     if (!MOCK_ENABLED) return;
     store.addHostLog('warn', 'Running against the built-in mock backend; no real process is being inspected.');
   }, [store]);
+
+  // ---- View state ---------------------------------------------------------------------
+
+  // The panel is written as soon as it changes; the offsets are written by the scroll handler
+  // below. Together they are what the next launch opens with.
+  useEffect(() => {
+    activePanelRef.current = activePanel;
+    patchViewState({ panel: activePanel });
+  }, [activePanel]);
+
+  // The scroll container is one element shared by every tab, so its position is remembered per
+  // tab rather than globally: switching from a long table to a short view must not open the
+  // short view halfway down another tab's content.
+  useEffect(() => {
+    const element = mainScrollRef.current;
+    if (!element) return;
+
+    // Trailing write rather than one per frame: localStorage is synchronous, and a fast scroll
+    // would otherwise block the main thread dozens of times a second.
+    let timer = 0;
+    const flush = () => {
+      timer = 0;
+      patchViewState({ panel: activePanelRef.current, scrollTops: scrollTopsRef.current });
+    };
+
+    const remember = () => {
+      // While an offset is being restored, the browser clamps it until the panel is tall enough.
+      // Saving that intermediate value would replace the position still being restored.
+      if (restoringScrollRef.current) return;
+      scrollTopsRef.current[activePanelRef.current] = element.scrollTop;
+      if (timer === 0) timer = window.setTimeout(flush, 200);
+    };
+
+    // A webview can be closed before the trailing write fires. Write the last position
+    // synchronously when the window is being hidden instead of trusting the pending timer.
+    const flushNow = () => {
+      if (timer !== 0) {
+        clearTimeout(timer);
+        timer = 0;
+      }
+      if (restoringScrollRef.current) return;
+      scrollTopsRef.current[activePanelRef.current] = element.scrollTop;
+      patchViewState({ panel: activePanelRef.current, scrollTops: scrollTopsRef.current });
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flushNow();
+    };
+
+    element.addEventListener('scroll', remember, { passive: true });
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flushNow);
+
+    return () => {
+      element.removeEventListener('scroll', remember);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flushNow);
+      if (timer !== 0) clearTimeout(timer);
+    };
+  }, []);
+
+  // Re-applies the remembered offset whenever the open tab changes, including the first paint.
+  //
+  // A panel's content arrives after that paint — counters, tables and findings are rendered from
+  // data that streams in — so the container can still be too short and the browser clamps the
+  // offset. The position is therefore re-applied while the panel grows, for a bounded time. The
+  // user's own scroll wins: as soon as they touch the view the remembered position is dropped,
+  // because fighting a scroll the user just made is worse than losing the old one.
+  useEffect(() => {
+    const element = mainScrollRef.current;
+    if (!element) return;
+
+    const target = scrollTopsRef.current[activePanel] ?? 0;
+    const startedAt = performance.now();
+    let frame = 0;
+    let stopped = false;
+
+    const stop = () => {
+      stopped = true;
+      restoringScrollRef.current = false;
+      if (frame !== 0) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
+    };
+
+    const onUserInput = () => stop();
+    const inputEvents = ['wheel', 'touchmove', 'pointerdown', 'keydown'] as const;
+    for (const type of inputEvents) element.addEventListener(type, onUserInput, { passive: true });
+
+    if (target > 0) {
+      restoringScrollRef.current = true;
+
+      const apply = () => {
+        if (stopped) return;
+        element.scrollTop = target;
+        const settled = Math.abs(element.scrollTop - target) <= 1;
+        if (settled || performance.now() - startedAt > 4000) {
+          stop();
+          return;
+        }
+        frame = requestAnimationFrame(apply);
+      };
+
+      apply();
+    } else {
+      // A tab without a remembered offset opens at the top, not wherever the previous tab was.
+      element.scrollTop = 0;
+    }
+
+    return () => {
+      stop();
+      for (const type of inputEvents) element.removeEventListener(type, onUserInput);
+    };
+  }, [activePanel]);
 
   // ---- Event subscriptions ------------------------------------------------------------
 
@@ -191,6 +548,10 @@ export function App() {
         });
         if (status.state === 'stopped' || status.state === 'failed') {
           setAttachedPid(null);
+          setAttachedContainer(null);
+          // The open container lists described the target of the session that just ended, so they
+          // are re-listed now: a service that restarted shows its new pid without a manual Refresh.
+          void refreshDocker();
           // The session's stdout pump writes the recording footer before it reports the
           // terminal status, so by now the file is complete and worth re-reading.
           setRecording(null);
@@ -235,21 +596,27 @@ export function App() {
       disposed = true;
       for (const unlisten of unlisteners) unlisten();
     };
-  }, [store]);
+  }, [store, refreshDocker]);
 
   // ---- Session control ----------------------------------------------------------------
 
   const attach = useCallback(
-    async (process_: DotnetProcessInfo) => {
+    async (process_: DotnetProcessInfo, container?: string): Promise<boolean> => {
       setError(null);
+      setResumeNote(null);
       store.reset();
       store.setHistorySeconds(settings.historySeconds, settings.intervalMs);
+      // Where a capture will be written is decided by the target, and only this call knows
+      // whether that target lives in a container: such a capture stays a path inside it until
+      // the host copies the file out, so the rail has to know before the first message arrives.
+      store.setCaptureLocation(container ?? null);
 
       const wantsRecording = recordEnabled;
       const wantsCapture = deepCaptureEnabled;
+      const where = container ? ` in container ${container}` : '';
       store.addHostLog(
         'info',
-        `Attaching to ${process_.name} (pid ${process_.pid})…${wantsRecording ? ' Recording to disk.' : ''}${
+        `Attaching to ${process_.name} (pid ${process_.pid})${where}…${wantsRecording ? ' Recording to disk.' : ''}${
           wantsCapture ? ' Deep capture armed for allocation call sites.' : ''
         }`,
       );
@@ -263,17 +630,31 @@ export function App() {
       try {
         const session = await api.startSession({
           pid: process_.pid,
+          container: container ?? null,
           probes,
           deepCapture: wantsCapture,
           intervalMs: settings.intervalMs,
           maxTypes: settings.maxAllocationTypes,
           verbose: settings.verboseCollector,
           record: wantsRecording,
-          targetName: process_.name,
+          // The container is part of the target's identity: a recording of `dotnet` from two
+          // services would otherwise carry the same name.
+          targetName: container ? `${process_.name} (${container})` : process_.name,
           targetRuntime: process_.runtimeVersion ?? null,
         });
         setSessionId(session.sessionId);
         setAttachedPid(process_.pid);
+        setAttachedContainer(container ?? null);
+        // Remembered as a marker, not as an instruction to attach again: the rail can point at
+        // the target after a restart, but starting a session is still the user's decision.
+        const remembered: LastTarget = {
+          pid: process_.pid,
+          name: process_.name,
+          container: container ?? null,
+          atUnixMs: Date.now(),
+        };
+        setLastTarget(remembered);
+        patchRailState({ lastTarget: remembered });
         setRecording(session.recording ?? null);
         store.setSession({ sessionId: session.sessionId, pid: process_.pid, state: 'running', detail: null });
 
@@ -281,14 +662,132 @@ export function App() {
           store.addHostLog('info', `Recording to ${session.recording.path}.`);
           setRecordingsToken((token) => token + 1);
         }
+        return true;
       } catch (attachError) {
         const message = messageOf(attachError);
         setError(message);
         store.addHostLog('error', message);
+        return false;
       }
     },
     [deepCaptureEnabled, recordEnabled, selectedProbes, settings, store],
   );
+
+  /**
+   * Attaches to the target of the last session with one click, after checking it still exists.
+   *
+   * The check is a fresh listing rather than a lookup in the rail: a collapsed container has no
+   * process list at all, and the host list on screen may be seconds old — which is exactly the
+   * window in which a restarted service changes pid. A target is matched by pid *and* name,
+   * because pid reuse would otherwise attach the collector to an unrelated process. When the
+   * target is gone the rail says why instead of leaving a button that silently does nothing.
+   */
+  const resumeLastTarget = useCallback(async () => {
+    if (!lastTarget || resuming) return;
+
+    setResumeNote(null);
+    setError(null);
+
+    if (replayActive) {
+      setResumeNote('A recording is open. Close the replay before resuming a live session.');
+      return;
+    }
+    if (sessionState === 'running' || sessionState === 'starting') {
+      setResumeNote('A session is already attached. Detach first.');
+      return;
+    }
+    if (sessionState === 'stopping') {
+      setResumeNote('The previous session is still detaching. Try again in a moment.');
+      return;
+    }
+
+    const { pid, name, container } = lastTarget;
+    setResuming(true);
+
+    try {
+      if (container) {
+        const status = await api.dockerStatus();
+        setDocker(status);
+        if (!status.available) {
+          setResumeNote(
+            `Docker is not reachable, so ${container} cannot be checked. Start Docker and try again.`,
+          );
+          return;
+        }
+
+        const containersNow = await api.listDockerContainers();
+        setContainers(containersNow);
+        if (!containersNow.some((entry) => entry.name === container)) {
+          setResumeNote(`Container ${container} is not running, so ${name} (pid ${pid}) is gone.`);
+          return;
+        }
+
+        // A periodic refresh may already be listing this container. Saying so is better than
+        // reporting a listing failure that never happened.
+        if (containerBusyRef.current.includes(container)) {
+          setResumeNote(`A listing for ${container} is already running. Try again in a moment.`);
+          return;
+        }
+
+        // Listing also stages the collector when needed, so a resume after a restart behaves
+        // exactly like expanding the container by hand.
+        const list = await listContainerProcesses(container);
+        if (list === null) {
+          setResumeNote(`Could not list the processes in ${container}. See the error above.`);
+          return;
+        }
+
+        const again = list.find((entry) => entry.pid === pid);
+        if (!again) {
+          setResumeNote(`pid ${pid} (${name}) is no longer running in ${container}.`);
+          return;
+        }
+        if (again.name !== name) {
+          setResumeNote(
+            `pid ${pid} in ${container} now belongs to ${again.name}, not ${name}. Refusing to attach to a different process.`,
+          );
+          return;
+        }
+
+        // The attached row lives under the container, so open it: otherwise a resume would leave
+        // the rail looking as though nothing had been selected.
+        if (!expandedContainersRef.current.includes(container)) {
+          const next = [...expandedContainersRef.current, container];
+          expandedContainersRef.current = next;
+          setExpandedContainers(next);
+          patchRailState({ expandedContainers: next });
+        }
+
+        if (!(await attach(again, container))) {
+          setResumeNote(`The collector could not attach to ${name} (pid ${pid}). See the banner for the reason.`);
+        }
+        return;
+      }
+
+      const list = await api.listProcesses(false);
+      setProcesses(list);
+
+      const again = list.find((entry) => entry.pid === pid);
+      if (!again) {
+        setResumeNote(`pid ${pid} (${name}) is no longer running. Start it again, then resume.`);
+        return;
+      }
+      if (again.name !== name) {
+        setResumeNote(
+          `pid ${pid} now belongs to ${again.name}, not ${name}. Refusing to attach to a different process.`,
+        );
+        return;
+      }
+
+      if (!(await attach(again))) {
+        setResumeNote(`The collector could not attach to ${name} (pid ${pid}). See the banner for the reason.`);
+      }
+    } catch (resumeError) {
+      setResumeNote(messageOf(resumeError));
+    } finally {
+      setResuming(false);
+    }
+  }, [attach, lastTarget, listContainerProcesses, replayActive, resuming, sessionState]);
 
   const detach = useCallback(async () => {
     if (!sessionId) return;
@@ -299,6 +798,7 @@ export function App() {
       setError(messageOf(detachError));
     } finally {
       setAttachedPid(null);
+      setAttachedContainer(null);
       setSessionId(null);
     }
   }, [sessionId]);
@@ -476,13 +976,16 @@ export function App() {
   );
   const activeDefinition = panels.find((panel) => panel.definition.id === activePanel) ?? panels[0];
 
-  // If the active view is not available for the connected collector, fall back to one that is.
+  // If the restored view no longer exists, or is not available for the connected collector, fall
+  // back to one that is. The id check matters because `activeDefinition` already falls back to
+  // the first panel, which would otherwise leave no tab marked as selected.
   useEffect(() => {
-    if (!activeDefinition?.available) {
+    const known = panels.some((panel) => panel.definition.id === activePanel);
+    if (!known || !activeDefinition?.available) {
       const fallback = panels.find((panel) => panel.available);
       if (fallback) setActivePanel(fallback.definition.id);
     }
-  }, [activeDefinition, panels]);
+  }, [activeDefinition, activePanel, panels]);
 
   const panelContext: PanelContext = {
     store,
@@ -599,6 +1102,16 @@ export function App() {
       <div className="body">
         <ProcessPicker
           processes={processes}
+          docker={docker}
+          containers={containers}
+          containerProcesses={containerProcesses}
+          expandedContainers={expandedContainers}
+          containerBusy={containerBusy}
+          lastTarget={lastTarget}
+          resuming={resuming}
+          resumeNote={resumeNote}
+          attachedContainer={attachedContainer}
+          attachedProcess={attachedProcess}
           loading={loadingProcesses}
           attachedPid={attachedPid}
           sessionState={sessionState}
@@ -606,15 +1119,21 @@ export function App() {
           selectedProbes={selectedProbes}
           intervalMs={settings.intervalMs}
           maxTypes={settings.maxAllocationTypes}
-          error={null}
+          error={containerError}
           recordingPath={recording?.path ?? null}
           recordEnabled={recordEnabled}
           deepCaptureSupported={capabilities?.supports?.includes('allocation-call-sites') ?? false}
           deepCaptureEnabled={deepCaptureEnabled}
           capturePath={store.capturePath}
+          captureOnThisMachine={store.captureOnThisMachine}
+          captureCopyError={store.captureCopyError}
+          captureContainer={store.captureContainer}
           replayActive={replayActive}
-          onRefresh={() => void refreshProcesses()}
-          onAttach={(process_) => void attach(process_)}
+          onRefresh={() => void refreshAll()}
+          onRefreshContainers={() => void refreshDocker()}
+          onToggleContainer={toggleContainer}
+          onAttach={(process_, container) => void attach(process_, container)}
+          onResume={() => void resumeLastTarget()}
           onDetach={() => void detach()}
           onToggleRecord={(enabled) => void toggleRecord(enabled)}
           onToggleDeepCapture={setDeepCaptureEnabled}
@@ -655,7 +1174,7 @@ export function App() {
             <span className="tabs-meta">{activeDefinition?.definition.hint}</span>
           </nav>
 
-          <div className="main-scroll">
+          <div className="main-scroll" ref={mainScrollRef}>
             {activeDefinition && !activeDefinition.available ? (
               <div className="notice notice-warning">
                 <strong>{activeDefinition.definition.label} is not available.</strong>

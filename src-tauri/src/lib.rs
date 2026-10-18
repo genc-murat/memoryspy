@@ -13,7 +13,9 @@
 // process, with no GUI in the loop.
 pub mod collector;
 mod commands;
+pub mod docker;
 pub mod recording;
+mod reveal;
 mod settings;
 
 use std::sync::Arc;
@@ -70,11 +72,17 @@ pub fn run() {
                         .map(|dir| dir.display().to_string()),
                     "collector": location,
                     "capabilities": capabilities,
+                    // Whether the app can reach containerised targets, and whether the Linux
+                    // collector those sessions need has been published.
+                    "docker": docker::status(),
                     "settings": user_settings,
                 });
 
                 // stdout because this is meant to be piped into a report.
-                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
                 std::process::exit(if location.found { 0 } else { 3 });
             }
 
@@ -87,6 +95,9 @@ pub fn run() {
             commands::get_environment,
             commands::refresh_collector,
             commands::list_processes,
+            commands::get_docker_status,
+            commands::list_docker_containers,
+            commands::list_container_processes,
             commands::get_capabilities,
             commands::start_session,
             commands::stop_session,
@@ -98,6 +109,7 @@ pub fn run() {
             commands::stop_recording,
             commands::list_recordings,
             commands::delete_recording,
+            commands::reveal_in_folder,
             commands::start_playback,
             commands::pause_playback,
             commands::resume_playback,
@@ -116,7 +128,8 @@ pub fn run() {
                 if let Some(state) = app.try_state::<AppState>() {
                     // Live sessions first: their stop path writes the recording footer, so it
                     // has to run before anything else claims the shutdown.
-                    let handles: Vec<_> = state.sessions.lock().unwrap().values().cloned().collect();
+                    let handles: Vec<_> =
+                        state.sessions.lock().unwrap().values().cloned().collect();
                     for handle in handles {
                         handle.stop();
                     }

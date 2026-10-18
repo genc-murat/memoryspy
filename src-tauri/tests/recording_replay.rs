@@ -27,7 +27,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memoryspy_lib::collector::{self, EventSink, SessionRequest, SessionState};
-use memoryspy_lib::recording::{self, PlaybackHandle, PlaybackState, RecordingTarget, RecordingWriter};
+use memoryspy_lib::recording::{
+    self, PlaybackHandle, PlaybackState, RecordingTarget, RecordingWriter,
+};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------------------
@@ -135,7 +137,9 @@ impl CapturingSink {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|payload| serde_json::from_value::<PlaybackState>(payload["state"].clone()).ok())
+            .filter_map(|payload| {
+                serde_json::from_value::<PlaybackState>(payload["state"].clone()).ok()
+            })
             .collect()
     }
 
@@ -197,8 +201,13 @@ impl CapturingSink {
 #[test]
 fn a_recording_round_trips_through_disk() {
     let dir = TempDir::new("roundtrip");
-    let writer = RecordingWriter::create(dir.path(), leaky_target(), json!({ "intervalMs": 500 }), false)
-        .expect("the recording must be created");
+    let writer = RecordingWriter::create(
+        dir.path(),
+        leaky_target(),
+        json!({ "intervalMs": 500 }),
+        false,
+    )
+    .expect("the recording must be created");
 
     let base = now_ms();
     writer.record_message(&json!({
@@ -223,7 +232,10 @@ fn a_recording_round_trips_through_disk() {
         summary.target_name.as_deref(),
         Some("MemorySpy.Samples.LeakyCache")
     );
-    assert_eq!(summary.format_version, Some(recording::RECORDING_FORMAT_VERSION));
+    assert_eq!(
+        summary.format_version,
+        Some(recording::RECORDING_FORMAT_VERSION)
+    );
     assert!(!summary.started_mid_session);
     assert!(summary.size_bytes > 0);
     assert!(
@@ -232,7 +244,9 @@ fn a_recording_round_trips_through_disk() {
         summary.duration_ms
     );
     assert!(
-        summary.file_name.starts_with("memoryspy-MemorySpy.Samples.LeakyCache-4242-")
+        summary
+            .file_name
+            .starts_with("memoryspy-MemorySpy.Samples.LeakyCache-4242-")
             && summary.file_name.ends_with(".jsonl"),
         "unexpected file name: {}",
         summary.file_name
@@ -241,7 +255,12 @@ fn a_recording_round_trips_through_disk() {
     // The histogram is what a replay uses to decide which views it can fill, so it must
     // describe the file's real contents.
     assert_eq!(summary.message_types.get("counter.sample"), Some(&2));
-    assert_eq!(summary.message_types.len(), 1, "{:?}", summary.message_types);
+    assert_eq!(
+        summary.message_types.len(),
+        1,
+        "{:?}",
+        summary.message_types
+    );
 
     // Replaying must reproduce the recorded envelopes exactly, timestamps included. The
     // frontend plots message.ts rather than its own clock, so a rewritten or dropped
@@ -255,8 +274,8 @@ fn a_recording_round_trips_through_disk() {
         .collect();
 
     let sink = Arc::new(CapturingSink::default());
-    let playback =
-        PlaybackHandle::start(sink.clone(), writer.path(), Some(1000.0)).expect("the replay must start");
+    let playback = PlaybackHandle::start(sink.clone(), writer.path(), Some(1000.0))
+        .expect("the replay must start");
 
     assert!(
         sink.wait_for_state(PlaybackState::Finished, Duration::from_secs(10)),
@@ -270,16 +289,26 @@ fn a_recording_round_trips_through_disk() {
         .filter(|message| message["type"] != "log")
         .collect();
 
-    assert_eq!(replayed, expected, "the replay must reproduce the recorded stream");
+    assert_eq!(
+        replayed, expected,
+        "the replay must reproduce the recorded stream"
+    );
 
     // The recorded stderr line survives too, as a log envelope carrying the original time
     // rather than the time the replay happened to reach it.
     let logs: Vec<Value> = sink.of_type("log");
-    assert_eq!(logs.len(), 1, "the recorded log line was lost: {:?}", sink.envelopes());
+    assert_eq!(
+        logs.len(),
+        1,
+        "the recorded log line was lost: {:?}",
+        sink.envelopes()
+    );
     assert_eq!(logs[0]["data"]["message"], "collector said something");
     assert_eq!(logs[0]["data"]["level"], "debug");
 
-    let finished = sink.last_playback().expect("playback status was never reported");
+    let finished = sink
+        .last_playback()
+        .expect("playback status was never reported");
     assert_eq!(finished["state"], "finished");
     assert!(finished["durationMs"].as_u64().unwrap() >= 500);
     assert!(finished["emitted"].as_u64().unwrap() >= 3);
@@ -306,11 +335,20 @@ fn a_recording_without_a_header_still_replays() {
 
     let summary = recording::read_summary(&path).expect("a headerless dump must still summarize");
     assert_eq!(summary.message_count, 2);
-    assert_eq!(summary.skipped_lines, 1, "a corrupt line must be counted, not fatal");
+    assert_eq!(
+        summary.skipped_lines, 1,
+        "a corrupt line must be counted, not fatal"
+    );
     assert_eq!(summary.line_count, 3);
-    assert!(!summary.complete, "no footer was written, so the recording is incomplete");
+    assert!(
+        !summary.complete,
+        "no footer was written, so the recording is incomplete"
+    );
     assert_eq!(summary.format_version, None);
-    assert_eq!(summary.duration_ms, 500, "the timeline must come from the first event");
+    assert_eq!(
+        summary.duration_ms, 500,
+        "the timeline must come from the first event"
+    );
 
     let sink = Arc::new(CapturingSink::default());
     PlaybackHandle::start(sink.clone(), &path, Some(1000.0)).expect("the replay must start");
@@ -335,7 +373,10 @@ fn an_empty_recording_is_rejected_with_an_explanation() {
     let error = PlaybackHandle::start(Arc::new(CapturingSink::default()), &path, None)
         .err()
         .expect("a file with no events must not start a replay");
-    assert!(error.contains("no recorded events"), "unhelpful error: {error}");
+    assert!(
+        error.contains("no recorded events"),
+        "unhelpful error: {error}"
+    );
 }
 
 #[test]
@@ -363,7 +404,10 @@ fn deletion_is_confined_to_the_recordings_folder() {
     // rather than by comparing strings.
     let escaped = recordings.join("..").join("precious.jsonl");
     assert!(recording::resolve_inside(&recordings, &escaped).is_err());
-    assert!(outside.is_file(), "the guard must not delete anything on its own");
+    assert!(
+        outside.is_file(),
+        "the guard must not delete anything on its own"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -391,7 +435,8 @@ fn pause_seek_and_speed_control_a_replay() {
 
     let sink = Arc::new(CapturingSink::default());
     // Half speed, so a gap is 800 ms of wall clock and the timing assertions are decisive.
-    let playback = PlaybackHandle::start(sink.clone(), writer.path(), Some(0.5)).expect("the replay must start");
+    let playback = PlaybackHandle::start(sink.clone(), writer.path(), Some(0.5))
+        .expect("the replay must start");
 
     assert!(
         sink.wait_for_type("counter.sample", 1, Duration::from_secs(5)),
@@ -430,7 +475,9 @@ fn pause_seek_and_speed_control_a_replay() {
         "the seek did not replay from the start"
     );
     assert!(
-        sink.playback_generations().iter().any(|generation| *generation >= 2),
+        sink.playback_generations()
+            .iter()
+            .any(|generation| *generation >= 2),
         "the seek did not bump the generation, so the UI could not know to clear: {:?}",
         sink.playback_generations()
     );
@@ -535,6 +582,7 @@ fn a_live_session_can_be_recorded_and_replayed_offline() {
             record_path: Some(path.display().to_string()),
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
             target_runtime: Some("10.0.9".to_string()),
+            container: None,
         },
         None,
     )
@@ -589,7 +637,11 @@ fn a_live_session_can_be_recorded_and_replayed_offline() {
     );
     assert_eq!(summary.target_pid, Some(pid));
     assert!(!summary.started_mid_session);
-    assert!(summary.duration_ms >= 1000, "the timeline is too short: {}", summary.duration_ms);
+    assert!(
+        summary.duration_ms >= 1000,
+        "the timeline is too short: {}",
+        summary.duration_ms
+    );
     assert!(
         summary.message_types.contains_key("allocation.sample")
             && summary.message_types.contains_key("counter.sample"),
@@ -617,28 +669,43 @@ fn a_live_session_can_be_recorded_and_replayed_offline() {
     // else and the offline analysis would answer a different question than the live view.
     let live: Vec<Value> = sink.of_type("allocation.sample");
     let replayed: Vec<Value> = replay_sink.of_type("allocation.sample");
-    assert!(!replayed.is_empty(), "the replay delivered no allocation samples");
-    assert_eq!(replayed, live, "the replay does not match what was recorded live");
+    assert!(
+        !replayed.is_empty(),
+        "the replay delivered no allocation samples"
+    );
+    assert_eq!(
+        replayed, live,
+        "the replay does not match what was recorded live"
+    );
 
     let live_counters = sink.of_type("counter.sample");
-    assert!(!live_counters.is_empty(), "nothing was recorded to compare against");
+    assert!(
+        !live_counters.is_empty(),
+        "nothing was recorded to compare against"
+    );
     assert_eq!(
         sink.of_type("counter.sample"),
         replay_sink.of_type("counter.sample"),
         "the replayed counters differ from the recorded ones"
     );
-    assert_eq!(sink.of_type("heap.stats"), replay_sink.of_type("heap.stats"));
+    assert_eq!(
+        sink.of_type("heap.stats"),
+        replay_sink.of_type("heap.stats")
+    );
 
     // And the question the whole app exists to answer still has an answer offline.
-    let types = replayed
-        .last()
-        .unwrap()["data"]["types"]
+    let types = replayed.last().unwrap()["data"]["types"]
         .as_array()
         .expect("allocation.sample must carry types");
     assert!(
-        types.iter().any(|entry| entry["typeName"] == "SessionRecord"),
+        types
+            .iter()
+            .any(|entry| entry["typeName"] == "SessionRecord"),
         "the leaking type is not visible in the replay: {:?}",
-        types.iter().filter_map(|e| e["typeName"].as_str()).collect::<Vec<_>>()
+        types
+            .iter()
+            .filter_map(|e| e["typeName"].as_str())
+            .collect::<Vec<_>>()
     );
 
     let finished = replay_sink.last_playback().unwrap();

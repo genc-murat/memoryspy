@@ -36,7 +36,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/collector": "collector"
+      "resources/collector": "collector",
+      "resources/collector-docker": "collector-docker"
     }
   }
 }

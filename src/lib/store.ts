@@ -2,6 +2,8 @@ import type {
   AllocationSampleData,
   AllocationSamplingBasis,
   AllocationSiteData,
+  CaptureCopiedData,
+  CaptureCopyFailedData,
   CollectorMessage,
   CounterReading,
   GcEventData,
@@ -132,6 +134,30 @@ export class MetricsStore {
   capturePath: string | null = null;
   captureBytes = 0;
   captureTruncated = false;
+  /**
+   * Whether {@link capturePath} names a file on *this* machine.
+   *
+   * A container session's capture is written inside the container, and the collector can only
+   * name that path until the host copies the file out — which happens after the session ends
+   * and can take a while. Until then the path must not be offered as something the user can
+   * open, so this is false from attach time (see {@link setCaptureLocation}) until
+   * `capture.copied` lands.
+   */
+  captureOnThisMachine = true;
+  /**
+   * The container the capture belongs to, when it belongs to one.
+   *
+   * Known from attach time rather than only from the copy messages: the path the collector
+   * reports while the copy is pending is inside this container.
+   */
+  captureContainer: string | null = null;
+  /**
+   * Why the last container capture could not be copied onto this machine, if it could not.
+   *
+   * When set, {@link capturePath} is a path *inside* {@link captureContainer}, not a local
+   * file; the rail must say so rather than offering it as something the user can open.
+   */
+  captureCopyError: string | null = null;
 
   session: SessionMeta = {
     sessionId: null,
@@ -277,6 +303,29 @@ export class MetricsStore {
           this.capturePath = data.capture.path;
           this.captureBytes = data.capture.bytes;
           this.captureTruncated = data.capture.truncated;
+        }
+        break;
+      }
+      case 'capture.copied': {
+        // Only a container session needs this: the collector named a path inside a container,
+        // and it is the host that puts the file somewhere the user can open.
+        const data = unwrap<CaptureCopiedData>(message);
+        if (data) {
+          this.capturePath = data.path;
+          this.captureBytes = data.bytes;
+          this.captureCopyError = null;
+          this.captureContainer = data.container ?? null;
+          this.captureOnThisMachine = true;
+        }
+        break;
+      }
+      case 'capture.copyFailed': {
+        const data = unwrap<CaptureCopyFailedData>(message);
+        if (data) {
+          this.capturePath = data.remote;
+          this.captureContainer = data.container;
+          this.captureCopyError = data.error;
+          this.captureOnThisMachine = false;
         }
         break;
       }
@@ -449,7 +498,23 @@ export class MetricsStore {
     this.capturePath = null;
     this.captureBytes = 0;
     this.captureTruncated = false;
+    this.captureCopyError = null;
+    this.captureContainer = null;
+    this.captureOnThisMachine = true;
     this.samples = 0;
+    this.markDirty();
+  }
+
+  /**
+   * Records where the next capture will be written, which only the attach knows.
+   *
+   * Called before the session exists on purpose: `session.started` can arrive while
+   * `start_session` is still on its way back, and a capture reported at that moment must not
+   * be read as a file on this machine.
+   */
+  setCaptureLocation(container: string | null) {
+    this.captureContainer = container;
+    this.captureOnThisMachine = container === null;
     this.markDirty();
   }
 

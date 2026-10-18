@@ -255,17 +255,18 @@ pub fn list_recordings(dir: &Path) -> Result<Vec<RecordingSummary>, String> {
                 started_at_unix_ms: 0,
                 last_event_unix_ms: 0,
                 duration_ms: 0,
-                size_bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),                        line_count: 0,
-                        message_count: 0,
-                        log_count: 0,
-                        skipped_lines: 0,
-                        end_reason: None,
-                        complete: false,
-                        format_version: None,
-                        started_mid_session: false,
-                        message_types: BTreeMap::new(),
-                        error: Some(error),
-                    },
+                size_bytes: fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                line_count: 0,
+                message_count: 0,
+                log_count: 0,
+                skipped_lines: 0,
+                end_reason: None,
+                complete: false,
+                format_version: None,
+                started_mid_session: false,
+                message_types: BTreeMap::new(),
+                error: Some(error),
+            },
         })
         .collect();
 
@@ -319,7 +320,12 @@ impl RecordingWriter {
         started_mid_session: bool,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
-        Self::create_at(&unique_path(dir, &target), target, options, started_mid_session)
+        Self::create_at(
+            &unique_path(dir, &target),
+            target,
+            options,
+            started_mid_session,
+        )
     }
 
     /// Creates a recording at an exact path. Used for an explicit destination and by tests.
@@ -329,7 +335,10 @@ impl RecordingWriter {
         options: Value,
         started_mid_session: bool,
     ) -> Result<Arc<Self>, String> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
         }
@@ -339,7 +348,12 @@ impl RecordingWriter {
             .write(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| format!("Could not create the recording file {}: {e}", path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "Could not create the recording file {}: {e}",
+                    path.display()
+                )
+            })?;
 
         let started_at_unix_ms = now_unix_ms();
 
@@ -448,7 +462,9 @@ impl RecordingWriter {
             last_event_unix_ms: now_unix_ms(),
             duration_ms: now_unix_ms().saturating_sub(self.started_at_unix_ms),
             size_bytes,
-            line_count: self.messages.load(Ordering::Relaxed) + self.logs.load(Ordering::Relaxed) + 1,
+            line_count: self.messages.load(Ordering::Relaxed)
+                + self.logs.load(Ordering::Relaxed)
+                + 1,
             message_count: self.messages.load(Ordering::Relaxed),
             log_count: self.logs.load(Ordering::Relaxed),
             skipped_lines: 0,
@@ -550,7 +566,11 @@ fn slugify(name: &str) -> String {
     }
 
     let slug = slug.trim_matches('-').to_string();
-    let slug = if slug.is_empty() { "process".to_string() } else { slug };
+    let slug = if slug.is_empty() {
+        "process".to_string()
+    } else {
+        slug
+    };
 
     slug.chars().take(MAX_TARGET_SLUG).collect()
 }
@@ -595,7 +615,11 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[derive(Debug, Clone)]
 enum RecordedEvent {
     Message(Value),
-    Log { level: String, message: String, ts: u64 },
+    Log {
+        level: String,
+        message: String,
+        ts: u64,
+    },
 }
 
 impl RecordedEvent {
@@ -654,7 +678,8 @@ struct RecordingReader {
 
 impl RecordingReader {
     fn open(path: &Path) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| format!("Could not open {}: {e}", path.display()))?;
+        let file =
+            File::open(path).map_err(|e| format!("Could not open {}: {e}", path.display()))?;
 
         let mut reader = Self {
             lines: BufReader::with_capacity(128 * 1024, file).lines(),
@@ -700,7 +725,10 @@ impl RecordingReader {
         self.note_event(envelope_ts(envelope));
 
         if let Some(message_type) = envelope.get("type").and_then(Value::as_str) {
-            *self.message_types.entry(message_type.to_string()).or_insert(0) += 1;
+            *self
+                .message_types
+                .entry(message_type.to_string())
+                .or_insert(0) += 1;
         }
     }
 
@@ -746,15 +774,13 @@ impl RecordingReader {
             };
 
             match value.get("kind").and_then(Value::as_str) {
-                Some(KIND_HEADER) => {
-                    match serde_json::from_value::<RecordingHeader>(value) {
-                        Ok(header) => {
-                            self.last_event_ts = self.last_event_ts.max(header.recorded_at_unix_ms);
-                            self.header = Some(header);
-                        }
-                        Err(_) => self.skipped += 1,
+                Some(KIND_HEADER) => match serde_json::from_value::<RecordingHeader>(value) {
+                    Ok(header) => {
+                        self.last_event_ts = self.last_event_ts.max(header.recorded_at_unix_ms);
+                        self.header = Some(header);
                     }
-                }
+                    Err(_) => self.skipped += 1,
+                },
                 Some(KIND_FOOTER) => {
                     if let Ok(footer) = serde_json::from_value::<RecordingFooter>(value) {
                         self.last_event_ts = self.last_event_ts.max(footer.ended_at_unix_ms);
@@ -1012,7 +1038,11 @@ pub struct PlaybackHandle(Arc<PlaybackInner>);
 impl PlaybackHandle {
     /// Starts replaying `path`. The recording is parsed eagerly so an unreadable file fails
     /// the command instead of producing a replay that silently shows nothing.
-    pub fn start(sink: Arc<dyn EventSink>, path: &Path, speed: Option<f64>) -> Result<Self, String> {
+    pub fn start(
+        sink: Arc<dyn EventSink>,
+        path: &Path,
+        speed: Option<f64>,
+    ) -> Result<Self, String> {
         let summary = read_summary(path)?;
 
         if summary.message_count == 0 && summary.log_count == 0 {
@@ -1022,7 +1052,9 @@ impl PlaybackHandle {
             ));
         }
 
-        let speed = speed.map(|value| value.clamp(SPEED_MIN, SPEED_MAX)).unwrap_or(SPEED_DEFAULT);
+        let speed = speed
+            .map(|value| value.clamp(SPEED_MIN, SPEED_MAX))
+            .unwrap_or(SPEED_DEFAULT);
 
         // Unique per run, not per file: replaying the same recording twice must be two
         // distinct replays as far as the UI is concerned, so that its buffers are cleared
@@ -1032,7 +1064,9 @@ impl PlaybackHandle {
         let inner = Arc::new(PlaybackInner {
             id: format!(
                 "replay-{}-{sequence}",
-                summary.file_name.trim_end_matches(&format!(".{RECORDING_EXTENSION}"))
+                summary
+                    .file_name
+                    .trim_end_matches(&format!(".{RECORDING_EXTENSION}"))
             ),
             path: path.to_path_buf(),
             sink,
@@ -1148,7 +1182,11 @@ enum CommandEffect {
     Stop,
 }
 
-fn apply_command(command: PlaybackCommand, pacing: &mut Pacing, inner: &PlaybackInner) -> CommandEffect {
+fn apply_command(
+    command: PlaybackCommand,
+    pacing: &mut Pacing,
+    inner: &PlaybackInner,
+) -> CommandEffect {
     match command {
         PlaybackCommand::Pause => {
             if !pacing.paused {
@@ -1208,7 +1246,9 @@ fn run_playback(inner: Arc<PlaybackInner>, receiver: Receiver<PlaybackCommand>) 
         let base_ts = reader.start_ts();
         let mut last_ts = base_ts;
         // A seek is a fast-forward until the target, then normal pacing resumes.
-        let mut fast_forward_until = pending_seek.take().map(|position| base_ts.saturating_add(position));
+        let mut fast_forward_until = pending_seek
+            .take()
+            .map(|position| base_ts.saturating_add(position));
         let mut batch: Vec<Value> = Vec::new();
         let mut last_batch_flush = Instant::now();
 
@@ -1325,7 +1365,9 @@ fn run_playback(inner: Arc<PlaybackInner>, receiver: Receiver<PlaybackCommand>) 
             last_ts = ts;
             inner.update(|runtime| runtime.emitted += 1);
 
-            if batch.len() >= PLAYBACK_BATCH_MAX || last_batch_flush.elapsed() >= PLAYBACK_BATCH_INTERVAL {
+            if batch.len() >= PLAYBACK_BATCH_MAX
+                || last_batch_flush.elapsed() >= PLAYBACK_BATCH_INTERVAL
+            {
                 flush_batch(&inner, &mut batch);
                 last_batch_flush = Instant::now();
             }

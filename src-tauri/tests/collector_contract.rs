@@ -54,7 +54,10 @@ impl EventSink for RecordingSink {
     }
 
     fn log(&self, _session_id: &str, level: &str, message: &str) {
-        self.logs.lock().unwrap().push((level.to_string(), message.to_string()));
+        self.logs
+            .lock()
+            .unwrap()
+            .push((level.to_string(), message.to_string()));
     }
 
     fn status(
@@ -138,7 +141,8 @@ fn spawn_sample_without_symbols() -> Option<(SampleGuard, PathBuf)> {
     }
 
     let source_dir = dll.parent()?;
-    let target_dir = std::env::temp_dir().join(format!("memoryspy-nopdb-sample-{}", std::process::id()));
+    let target_dir =
+        std::env::temp_dir().join(format!("memoryspy-nopdb-sample-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&target_dir);
     std::fs::create_dir_all(&target_dir).ok()?;
 
@@ -147,7 +151,11 @@ fn spawn_sample_without_symbols() -> Option<(SampleGuard, PathBuf)> {
         if !entry.path().is_file() {
             continue;
         }
-        if entry.path().extension().is_some_and(|extension| extension == "pdb") {
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "pdb")
+        {
             continue;
         }
         std::fs::copy(entry.path(), target_dir.join(entry.file_name())).ok()?;
@@ -181,9 +189,13 @@ fn capabilities_describe_the_expected_probes() {
     let location = collector::locate_collector();
     assert_located(&location);
 
-    let capabilities = collector::fetch_capabilities(&location).expect("capabilities must be readable");
+    let capabilities =
+        collector::fetch_capabilities(&location).expect("capabilities must be readable");
 
-    assert_eq!(capabilities["protocolVersion"], 1, "protocol version changed");
+    assert_eq!(
+        capabilities["protocolVersion"], 1,
+        "protocol version changed"
+    );
     assert_eq!(capabilities["tool"], "MemorySpy.Collector");
 
     let probes: Vec<&str> = capabilities["probes"]
@@ -194,13 +206,18 @@ fn capabilities_describe_the_expected_probes() {
         .collect();
 
     for expected in ["runtime-counters", "allocations", "gc-stats"] {
-        assert!(probes.contains(&expected), "capability list is missing '{expected}': {probes:?}");
+        assert!(
+            probes.contains(&expected),
+            "capability list is missing '{expected}': {probes:?}"
+        );
     }
 
     // The UI builds its panels from this handshake, so every probe must describe its events.
     for probe in capabilities["probes"].as_array().unwrap() {
         assert!(
-            probe["eventTypes"].as_array().is_some_and(|events| !events.is_empty()),
+            probe["eventTypes"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty()),
             "probe {} declares no event types; the UI cannot route it",
             probe["id"]
         );
@@ -232,19 +249,28 @@ fn process_listing_finds_the_leaking_sample() {
         .unwrap_or_else(|| {
             panic!(
                 "the sample (pid {sample_pid}) was not listed. Saw: {:?}",
-                processes.iter().map(|p| (p.pid, p.name.clone())).collect::<Vec<_>>()
+                processes
+                    .iter()
+                    .map(|p| (p.pid, p.name.clone()))
+                    .collect::<Vec<_>>()
             )
         });
 
     // Enrichment is what lets a user pick the right process out of a list, so it is part of
     // the contract rather than a nice-to-have.
     assert!(
-        found.command_line.as_deref().is_some_and(|line| line.contains("LeakyCache")),
+        found
+            .command_line
+            .as_deref()
+            .is_some_and(|line| line.contains("LeakyCache")),
         "command line was not enriched: {:?}",
         found.command_line
     );
     assert!(
-        found.runtime_version.as_deref().is_some_and(|version| version.starts_with("10.")),
+        found
+            .runtime_version
+            .as_deref()
+            .is_some_and(|version| version.starts_with("10.")),
         "runtime version was not resolved from the target: {:?}",
         found.runtime_version
     );
@@ -283,6 +309,7 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
             record_path: None,
             target_name: None,
             target_runtime: None,
+            container: None,
         },
         None,
     )
@@ -322,7 +349,10 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
     // the charts would mix megabytes and bytes on one axis.
     for name in ["gc-heap-size", "working-set", "gen-2-size", "loh-size"] {
         let reading = find(name);
-        assert_eq!(reading["unit"], "bytes", "{name} is not normalised to bytes");
+        assert_eq!(
+            reading["unit"], "bytes",
+            "{name} is not normalised to bytes"
+        );
         assert!(
             reading["value"].as_f64().is_some_and(|value| value > 0.0),
             "{name} reported a non-positive value: {}",
@@ -378,11 +408,15 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
         .unwrap();
 
     assert!(
-        busiest["typeName"].as_str().is_some_and(|name| !name.is_empty()),
+        busiest["typeName"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
         "allocation type had no name"
     );
     assert!(
-        busiest["intervalBytes"].as_f64().is_some_and(|bytes| bytes > 0.0),
+        busiest["intervalBytes"]
+            .as_f64()
+            .is_some_and(|bytes| bytes > 0.0),
         "the busiest type reported no allocation volume"
     );
 
@@ -411,7 +445,9 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
 
     if let Some(heap) = sink.of_type("heap.stats").last() {
         assert!(
-            heap["data"]["totalHeapBytes"].as_f64().is_some_and(|bytes| bytes > 0.0),
+            heap["data"]["totalHeapBytes"]
+                .as_f64()
+                .is_some_and(|bytes| bytes > 0.0),
             "heap statistics reported an empty heap while the target is allocating"
         );
     }
@@ -438,13 +474,17 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
 
     let statuses = sink.statuses.lock().unwrap().clone();
     assert!(
-        statuses.iter().any(|(state, _)| *state == SessionState::Stopped),
+        statuses
+            .iter()
+            .any(|(state, _)| *state == SessionState::Stopped),
         "no terminal status was reported: {statuses:?}"
     );
 
     // A clean stop must not be reported as a failure.
     assert!(
-        !statuses.iter().any(|(state, _)| *state == SessionState::Failed),
+        !statuses
+            .iter()
+            .any(|(state, _)| *state == SessionState::Failed),
         "the session ended as failed: {statuses:?}"
     );
 }
@@ -470,6 +510,7 @@ fn attaching_to_a_nonexistent_process_fails_with_a_useful_message() {
             record_path: None,
             target_name: None,
             target_runtime: None,
+            container: None,
         },
         None,
     );
@@ -479,12 +520,9 @@ fn attaching_to_a_nonexistent_process_fails_with_a_useful_message() {
     if let Ok(handle) = result {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let failed = sink
-                .statuses
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(state, _)| *state == SessionState::Failed || *state == SessionState::Stopped);
+            let failed = sink.statuses.lock().unwrap().iter().any(|(state, _)| {
+                *state == SessionState::Failed || *state == SessionState::Stopped
+            });
             if failed {
                 return;
             }
@@ -516,6 +554,7 @@ fn unknown_probe_ids_are_rejected() {
             record_path: None,
             target_name: None,
             target_runtime: None,
+            container: None,
         },
         None,
     );
@@ -523,12 +562,9 @@ fn unknown_probe_ids_are_rejected() {
     if let Ok(handle) = result {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            let terminal = sink
-                .statuses
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(state, _)| *state == SessionState::Failed || *state == SessionState::Stopped);
+            let terminal = sink.statuses.lock().unwrap().iter().any(|(state, _)| {
+                *state == SessionState::Failed || *state == SessionState::Stopped
+            });
             if terminal {
                 let logs = sink.logs.lock().unwrap().clone();
                 let messages = sink.of_type("error");
@@ -592,6 +628,7 @@ fn a_deep_capture_resolves_allocation_call_sites() {
             record_path: None,
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
             target_runtime: None,
+            container: None,
         },
         Some(capture_dir.clone()),
     )
@@ -700,11 +737,15 @@ fn a_deep_capture_resolves_allocation_call_sites() {
         .iter()
         .find(|site| {
             site["userCode"].as_bool().unwrap_or(false)
-                && site["site"].as_str().is_some_and(|name| name.contains("Program"))
+                && site["site"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("Program"))
         })
         .unwrap_or_else(|| panic!("no site in the sample's own code was reported: {data}"));
 
-    let frames = user_site["frames"].as_array().expect("a site must carry its call chain");
+    let frames = user_site["frames"]
+        .as_array()
+        .expect("a site must carry its call chain");
     assert!(!frames.is_empty(), "the site carried no frames");
     assert!(
         frames.len() > 1,
@@ -848,6 +889,7 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
             record_path: None,
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
             target_runtime: None,
+            container: None,
         },
         Some(capture_dir.clone()),
     )
@@ -887,9 +929,9 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
     let sites = data["sites"].as_array().expect("sites must be an array");
     assert!(!sites.is_empty(), "no call sites were reported: {data}");
     assert!(
-        sites
-            .iter()
-            .any(|site| site["site"].as_str().is_some_and(|name| name.contains("Program"))),
+        sites.iter().any(|site| site["site"]
+            .as_str()
+            .is_some_and(|name| name.contains("Program"))),
         "the sample's own code was not named without a PDB: {data}"
     );
 
@@ -910,7 +952,9 @@ fn call_sites_fall_back_to_method_names_without_pdbs() {
         );
         for frame in site["frames"].as_array().expect("frames must be an array") {
             assert!(
-                frame["method"].as_str().is_some_and(|name| !name.is_empty()),
+                frame["method"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty()),
                 "a frame lost its method name: {frame}"
             );
             assert!(
@@ -976,6 +1020,7 @@ fn a_size_capped_capture_still_resolves_call_sites() {
             record_path: None,
             target_name: Some("MemorySpy.Samples.LeakyCache".to_string()),
             target_runtime: None,
+            container: None,
         },
         Some(capture_dir.clone()),
     )
@@ -1018,14 +1063,11 @@ fn a_size_capped_capture_still_resolves_call_sites() {
 
     // The cap warns on the collector's stdout log channel (RecordingSink.logs only carries
     // stderr), so the explanation is checked where the user actually reads it.
-    let cap_warned = sink
-        .of_type("log")
-        .iter()
-        .any(|message| {
-            message["data"]["message"]
-                .as_str()
-                .is_some_and(|text| text.contains("size limit"))
-        });
+    let cap_warned = sink.of_type("log").iter().any(|message| {
+        message["data"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("size limit"))
+    });
     assert!(
         cap_warned,
         "the size-limit warning was not reported; logs: {:?}",
@@ -1073,6 +1115,7 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
             record_path: None,
             target_name: None,
             target_runtime: None,
+            container: None,
         },
         None,
     )
@@ -1106,14 +1149,31 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
     let snapshots = sink.of_type("heap.snapshot");
     let data = &snapshots[0]["data"];
 
-    let object_count = data["objectCount"].as_u64().expect("objectCount must be a number");
-    let total_bytes = data["totalBytes"].as_u64().expect("totalBytes must be a number");
-    let reachable = data["reachableObjects"].as_u64().expect("reachableObjects must be a number");
-    let edge_count = data["edgeCount"].as_u64().expect("edgeCount must be a number");
+    let object_count = data["objectCount"]
+        .as_u64()
+        .expect("objectCount must be a number");
+    let total_bytes = data["totalBytes"]
+        .as_u64()
+        .expect("totalBytes must be a number");
+    let reachable = data["reachableObjects"]
+        .as_u64()
+        .expect("reachableObjects must be a number");
+    let edge_count = data["edgeCount"]
+        .as_u64()
+        .expect("edgeCount must be a number");
 
-    assert!(object_count > 1_000, "the sample holds far more than {object_count} objects");
-    assert!(total_bytes > 0, "a snapshot with no live bytes is not a snapshot");
-    assert!(edge_count > 0, "a graph with no references cannot answer what holds what");
+    assert!(
+        object_count > 1_000,
+        "the sample holds far more than {object_count} objects"
+    );
+    assert!(
+        total_bytes > 0,
+        "a snapshot with no live bytes is not a snapshot"
+    );
+    assert!(
+        edge_count > 0,
+        "a graph with no references cannot answer what holds what"
+    );
     assert!(
         data["pauseMs"].as_u64().is_some_and(|pause| pause > 0),
         "the walk must report the pause it cost the target, not hide it"
@@ -1132,7 +1192,9 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
         // A partial walk must say so *and* withhold its paths: a chain drawn through a graph with
         // references missing is a guess, which is the one thing this payload must never be.
         assert!(
-            data["retention"].as_array().is_some_and(|paths| paths.is_empty()),
+            data["retention"]
+                .as_array()
+                .is_some_and(|paths| paths.is_empty()),
             "a partial walk must not also report retention paths, but {note} came with paths"
         );
         panic!("the walk of a freshly started sample came back partial: {note}");
@@ -1154,7 +1216,9 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
         "the sample's cache should hold thousands of records by the time it is walked: {session_record}"
     );
     assert!(
-        session_record["liveBytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        session_record["liveBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
         "SessionRecord must account for live bytes: {session_record}"
     );
 
@@ -1162,7 +1226,9 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
     // case where the two must differ: every record holds a 256-byte payload, so removing the records
     // frees far more than the records themselves. If the retained measure were ever accidentally
     // wired to the live one, this is what would catch it.
-    let live = session_record["liveBytes"].as_u64().expect("liveBytes must be a number");
+    let live = session_record["liveBytes"]
+        .as_u64()
+        .expect("liveBytes must be a number");
     let retained = session_record["retainedBytes"]
         .as_u64()
         .unwrap_or_else(|| panic!("SessionRecord has no retained size: {session_record}"));
@@ -1178,7 +1244,9 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
     );
 
     // The answer the panel exists to give: the chain from a root to one live instance.
-    let retention = data["retention"].as_array().expect("retention must be an array");
+    let retention = data["retention"]
+        .as_array()
+        .expect("retention must be an array");
     let path = retention
         .iter()
         .find(|path| path["typeName"] == "SessionRecord")
@@ -1191,17 +1259,26 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
         "the path to the cache's records is short enough to reach the root: {path}"
     );
 
-    let frames = path["frames"].as_array().expect("a path must carry its frames");
+    let frames = path["frames"]
+        .as_array()
+        .expect("a path must carry its frames");
     assert!(frames.len() >= 2, "a one-frame path names nothing: {path}");
 
     // Root first, object last — the order the panel renders and the order the answer is read in.
     let last = frames.last().unwrap();
-    assert_eq!(last["typeName"], "SessionRecord", "the chain must end at the type it explains");
+    assert_eq!(
+        last["typeName"], "SessionRecord",
+        "the chain must end at the type it explains"
+    );
 
     for frame in frames {
         assert!(
-            frame["typeName"].as_str().is_some_and(|name| !name.is_empty())
-                && frame["label"].as_str().is_some_and(|label| !label.is_empty())
+            frame["typeName"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
+                && frame["label"]
+                    .as_str()
+                    .is_some_and(|label| !label.is_empty())
                 && frame["size"].as_u64().is_some(),
             "every frame must name what it is, what points at it and how big it is: {frame}"
         );
@@ -1275,6 +1352,10 @@ fn collector_is_located_from_build_output_during_development() {
     assert_located(&location);
 
     let assembly = Path::new(location.assembly_path.as_deref().unwrap());
-    assert!(assembly.is_file(), "located assembly does not exist: {}", assembly.display());
+    assert!(
+        assembly.is_file(),
+        "located assembly does not exist: {}",
+        assembly.display()
+    );
     assert_eq!(assembly.file_name().unwrap(), "MemorySpy.Collector.dll");
 }

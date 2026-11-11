@@ -443,32 +443,38 @@ async fn find_roots(
     const ROOT_OUTPUT_LIMIT: usize = 256 * 1024;
     let (path, tool) = (&target.path, &target.tool);
     let mut paths = Vec::new();
+    let mut use_root_limit = true;
     for (index, address) in samples.iter().enumerate() {
         let _ = progress.send(format!(
             "Tracing object {} of {} (0x{address:x})…",
             index + 1,
             samples.len()
         ));
+        let plain_command = format!("gcroot {address:x}");
+        let command = if use_root_limit {
+            format!("gcroot -limit 1 {address:x}")
+        } else {
+            plain_command.clone()
+        };
         let mut output = run_sos_with_limit(
             tool,
             path,
-            &format!("gcroot -limit 1 {address:x}"),
+            &command,
             Some(progress),
             Some(ROOT_OUTPUT_LIMIT),
         )
         .await?;
-        // Older SOS versions may not support -limit.
-        if [&output.stdout, &output.stderr].into_iter().any(|stream| {
-            String::from_utf8_lossy(stream).lines().any(|line| {
-                let line = line.to_ascii_lowercase();
-                line.contains("-limit")
-                    && (line.contains("unrecognized") || line.contains("unknown"))
-            })
-        }) {
+        // Some SOS parsers consume an unsupported option as the target and flag its operands.
+        if use_root_limit
+            && (gcroot_rejected_arguments(&output.stdout)
+                || gcroot_rejected_arguments(&output.stderr))
+        {
+            use_root_limit = false;
+            let _ = progress.send("Retrying the GC root search without the SOS root limit…".into());
             output = run_sos_with_limit(
                 tool,
                 path,
-                &format!("gcroot {address:x}"),
+                &plain_command,
                 Some(progress),
                 Some(ROOT_OUTPUT_LIMIT),
             )
@@ -529,6 +535,16 @@ async fn find_roots(
     Ok(DumpRoots {
         samples_checked: samples.len(),
         paths,
+    })
+}
+
+fn gcroot_rejected_arguments(output: &[u8]) -> bool {
+    String::from_utf8_lossy(output).lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        let line = line.strip_prefix("error:").unwrap_or(&line).trim_start();
+        line.starts_with("unrecognized command or argument ")
+            || (line.contains("-limit")
+                && (line.contains("unknown") || line.contains("unrecognized")))
     })
 }
 
@@ -1083,6 +1099,55 @@ mod tests {
         );
         assert_eq!(parse_address("0xABC"), Some(0xabc));
         assert_eq!(parse_address("abcd; exit"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_gcroot_without_the_limit_when_sos_rejects_its_operands() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("memoryspy-gcroot-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let tool = dir.join("dotnet-dump");
+        fs::write(
+            &tool,
+            r#"#!/bin/sh
+case "$4" in
+    'gcroot -limit 1 1dacfc00de8')
+        printf '%s\n' "Unrecognized command or argument '1'" \
+            "Unrecognized command or argument '1dacfc00de8'" \
+            'gcroot:' 'Usage:' '  > gcroot [options] [<target>]' >&2
+        ;;
+    'gcroot 1dacfc00de8')
+        printf '%s\n' 'HandleTable:' '  -> 000001dacfc00de8 System.Byte[]' 'Found 1 unique roots.'
+        ;;
+    'gcroot 2dacfc00de8')
+        printf '%s\n' 'Found 0 unique roots.'
+        ;;
+    *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = super::DumpTarget {
+            id: String::new(),
+            path: dir.join("sample.dmp"),
+            tool,
+        };
+        let progress = Channel::new(|_| Ok(()));
+        let result = tauri::async_runtime::block_on(super::find_roots(
+            &target,
+            &[0x1dacfc00de8, 0x2dacfc00de8],
+            &progress,
+        ));
+        fs::remove_dir_all(dir).unwrap();
+
+        let roots = result.unwrap();
+        assert_eq!(roots.samples_checked, 2);
+        assert_eq!(roots.paths.len(), 1);
+        assert_eq!(roots.paths[0].frames[0].address, "0x1dacfc00de8");
     }
 
     #[test]

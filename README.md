@@ -528,10 +528,9 @@ npm run dev
 
 Sahte mod, collector ile **aynı** mesaj zarfını üretir; yani gerçek protokolü doğrular.
 
-CI'da bu paket Ubuntu'da koşar ([.github/workflows/test.yml](.github/workflows/test.yml)): collector ve örnek
-önce derlenir, konteyner testleri için Linux collector publish edilir, ardından testler çalışır.
-Docker testleri atlanırsa iş **başarısız** olur — kapsamı ölçmeyen yeşil bir koşu, olmayan bir
-kapsamı raporlamak olurdu.
+CI testleri Ubuntu'da çalışır. Collector ve örnek derlendikten sonra Docker testleri için
+glibc ve musl collector'ları yayınlanır. Herhangi bir Docker testi atlanırsa CI işi başarısız olur.
+[Test iş akışı](.github/workflows/test.yml)
 
 Sözleşme testleri (`src-tauri/tests/collector_contract.rs`) örnek sızıntı uygulamasına
 gerçekten bağlanır ve şunları doğrular: collector bulunuyor mu, yetenekleri doğru mu
@@ -551,14 +550,14 @@ edilmiş olmasıdır:
 
 ```bash
 npm run collector:docker
+npm run collector:docker -- "$(node -p '"linux-" + process.arch')" musl  # Alpine testleri için
 cargo test --manifest-path src-tauri/Cargo.toml --test docker_container
 ```
 
 Docker yoksa test atlanır (ve bunu söyler). Var olan bir konteynere bağlanmak için
 `MEMORYSPY_TEST_CONTAINER=<ad>` verilir; o zaman hiçbir şey oluşturulmaz veya silinmez. Farklı bir
-base image için `MEMORYSPY_TEST_IMAGE` kullanılır. Daemon varsa ama collector publish edilmemişse
-test **başarısız olur**: CI'da Docker'ın hiç çalıştırılmadığı bir koşunun yeşil görünmesi, bu
-testlerin önlemek için var olduğu şeydir.
+base image için `MEMORYSPY_TEST_IMAGE` kullanılır. Docker çalışırken glibc collector eksikse
+glibc testleri başarısız olur. Yerel çalıştırmada musl collector eksikse Alpine testleri atlanır.
 
 Bir de derin yakalama zinciri test edilir: gerçek bir capture yazılır, `.nettrace`
 diskte kalır, ara ETLX silinir, frame'ler isimle çözülür (örnek uygulamanın kendi `Program`

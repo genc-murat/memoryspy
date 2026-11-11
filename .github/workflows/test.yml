@@ -5,12 +5,10 @@
 # * **The collector and the sample have to be built first.** The host/collector contract tests
 #   attach to a real leaking process, so a machine without `npm run prepare:all` fails them for a
 #   reason that has nothing to do with the code.
-# * **The Docker transport tests need the Linux collector.** They start their own throwaway
-#   container (`docker_container.rs`), but the binary they copy into it is published by
-#   `npm run collector:docker` — the one prerequisite a Docker daemon cannot provide itself.
-# * **A skipped Docker test is a failed job.** Those tests skip when no daemon is reachable, which
-#   is right on a laptop and wrong here: a green run that never touched a container would claim
-#   coverage it does not have. The step therefore greps the run's own output for the skip message.
+# * **The Docker transport tests need both Linux collector variants.** They start their own
+#   throwaway containers, but CI has to publish the glibc and musl collectors first.
+# * **A skipped Docker test is a failed job.** Local runs may skip tests when Docker or a
+#   collector variant is missing. CI requires coverage for both variants.
 #
 # Only Ubuntu runs the whole suite: the contract tests spawn the sample with `dotnet` and the
 # Docker tests need a Linux daemon, which the hosted Windows and macOS runners do not provide in
@@ -81,15 +79,16 @@ jobs:
       - name: Build the collector and the sample
         run: npm run prepare:all
 
-      # The tests copy this file into a container and start it with `docker exec`, so publishing
-      # the host build instead would leave every container test failing on "exec format error".
-      - name: Publish the Linux collector for container targets
-        run: npm run collector:docker
-
       - name: Report the Docker environment
         run: |
           docker version
           docker info --format '{{json .ServerVersion}}'
+
+      # The musl publisher uses the Docker daemon to bundle the Alpine C++ runtime.
+      - name: Publish glibc and musl collectors for Docker
+        run: |
+          npm run collector:docker
+          npm run collector:docker -- "$(node -p '"linux-" + process.arch')" musl
 
       # `--lib` carries the Docker CLI deadline's unit tests (a hanging command must be killed at
       # its timeout); without the selector those tests would never run in CI.
@@ -111,7 +110,7 @@ jobs:
             --test docker_container -- --nocapture 2>&1 | tee docker-tests.log
 
           if grep -q '^skipping:' docker-tests.log; then
-            echo "::error::The Docker transport tests skipped, so no container was profiled."
+            echo "::error::One or more Docker transport tests were skipped. See docker-tests.log for details."
             exit 1
           fi
 

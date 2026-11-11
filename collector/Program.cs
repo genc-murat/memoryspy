@@ -37,14 +37,19 @@ switch (args[0])
 
     case "cleanup":
     {
-        if (args.Length != 2 || !args[1].StartsWith("memoryspy-collector-", StringComparison.Ordinal)
-            || args[1].Any(character => !char.IsAsciiLetterOrDigit(character) && character != '-'))
+        // Two prefixes because the runtime directories are not matched by the executable's:
+        // `memoryspy-collector-libs-<rid>-<identity>` does not start with
+        // `memoryspy-collector-<rid>-`. Both are validated here because both come from the host
+        // and are used to build a glob inside the container's temporary directory.
+        if (args.Length is not (2 or 3)
+            || !IsCollectorPrefix(args[1], "memoryspy-collector-")
+            || (args.Length == 3 && !IsCollectorPrefix(args[2], "memoryspy-collector-libs-")))
         {
-            emitter.Error("cleanup requires a MemorySpy collector filename prefix.");
+            emitter.Error("cleanup requires a MemorySpy collector filename prefix and optionally a runtime directory prefix.");
             return 1;
         }
 
-        CleanupCollectors(args[1]);
+        CleanupCollectors(args[1], args.Length == 3 ? args[2] : null);
         return 0;
     }
 
@@ -85,6 +90,9 @@ switch (args[0])
 
     case "analyze":
         return RunAnalyze(args);
+
+    case "dump-source":
+        return DumpSourceLookup.Run(args, emitter);
 
     default:
         emitter.Error($"Unknown command '{args[0]}'. Run with --help for usage.");
@@ -282,22 +290,87 @@ static string CollectorIdentity()
     return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
 }
 
-static void CleanupCollectors(string prefix)
+/// <summary>
+/// Removes superseded collector binaries and their runtime directories from the temp folder.
+/// </summary>
+/// <remarks>
+/// A musl collector is staged twice: the executable (<c>memoryspy-collector-&lt;rid&gt;-&lt;identity&gt;</c>)
+/// and the directory holding the C++ runtime it loads
+/// (<c>memoryspy-collector-libs-&lt;rid&gt;-&lt;identity&gt;</c>). Each rebuild creates a new identity, so a
+/// long-lived container accumulates one ~2.8 MB directory per rebuild unless both kinds are
+/// pruned. The executable's prefix cannot match the runtime directories, hence the second one.
+///
+/// The grace period and the exclusions exist for the same reason as the binary cleanup: another
+/// attach may be copying or starting the same content-addressed pair, and the pair this process
+/// runs with is never stale. Linux keeps a running process's mapped files alive when unlinked, so
+/// removing an old directory the next attach after the grace period is safe.
+/// </remarks>
+static void CleanupCollectors(string prefix, string? librariesPrefix)
 {
     var current = Path.GetFullPath(Environment.ProcessPath
         ?? throw new InvalidOperationException("The collector executable path is unavailable."));
     var tempDirectory = Path.GetFullPath(Path.GetTempPath());
+    var grace = TimeSpan.FromDays(1);
 
     foreach (var path in Directory.EnumerateFiles(tempDirectory, $"{prefix}*"))
     {
         // Remove copies older than one day, leaving time for another attach to finish copying
         // or start executing the same content-addressed binary before this process prunes it.
         if (!string.Equals(Path.GetFullPath(path), current, StringComparison.Ordinal)
-            && DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > TimeSpan.FromDays(1))
+            && DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > grace)
         {
             File.Delete(path);
         }
     }
+
+    if (librariesPrefix is null)
+    {
+        return;
+    }
+
+    // The image may provide the C++ runtime itself, in which case the host set no library path
+    // and every staged directory is a leftover from an earlier build.
+    var librariesInUse = (Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? string.Empty)
+        .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(entry => Path.GetFullPath(entry))
+        .ToHashSet(StringComparer.Ordinal);
+
+    foreach (var directory in Directory.EnumerateDirectories(tempDirectory, $"{librariesPrefix}*"))
+    {
+        var path = Path.GetFullPath(directory);
+        if (librariesInUse.Contains(path)
+            || DateTime.UtcNow - Directory.GetLastWriteTimeUtc(path) <= grace)
+        {
+            continue;
+        }
+
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch (IOException)
+        {
+            // A concurrent attach can still be copying into or starting from it; the next
+            // cleanup retries rather than letting one busy directory stop the rest.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Same contract: cleanup is best effort and must not fail the session.
+        }
+    }
+}
+
+/// <summary>
+/// Whether <paramref name="value"/> is a safe prefix for a glob in the temp directory.
+/// </summary>
+/// <remarks>
+/// The required prefix is what makes this more than a character check: without it a caller could
+/// pass an empty string and make the collector enumerate the whole temporary directory.
+/// </remarks>
+static bool IsCollectorPrefix(string value, string required)
+{
+    return value.StartsWith(required, StringComparison.Ordinal)
+        && value.All(character => char.IsAsciiLetterOrDigit(character) || character == '-');
 }
 
 static IDisposable? RegisterSignal(PosixSignal signal, CollectorSession session)

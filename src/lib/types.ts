@@ -440,12 +440,33 @@ export interface DotnetProcessInfo {
   startTimeUnixMs?: number | null;
 }
 
+export type CollectorLibc = 'glibc' | 'musl';
+
+/** One Linux build the app can copy into a container. */
+export interface DockerCollectorVariant {
+  rid: string;
+  libc: CollectorLibc;
+  published: boolean;
+  /**
+   * A published musl build with no bundled C++ runtime. Bare Alpine images cannot start it;
+   * .NET Alpine images install the runtime themselves, so this is a warning, not a failure.
+   */
+  runtimeMissing: boolean;
+}
+
+export type RepairProblem = 'dockerUnavailable' | 'notMusl' | 'notPublished' | 'overrideActive';
+
 /** Whether containerised targets can be inspected, and why not when they cannot. */
 export interface DockerStatus {
   available: boolean;
   version?: string | null;
   /** Which Linux collectors are published; empty means `npm run collector:docker` is needed. */
   stagedRids: string[];
+  /**
+   * Every supported variant, published or not, for the container-support view. Empty when a
+   * custom `MEMORYSPY_DOCKER_COLLECTOR` binary replaces per-variant selection.
+   */
+  collectors: DockerCollectorVariant[];
   error?: string | null;
   /**
    * Why the daemon cannot be used, when it cannot. `cliMissing` means this machine has no Docker
@@ -453,6 +474,41 @@ export interface DockerStatus {
    * rail explains instead of hiding the section.
    */
   problem?: 'cliMissing' | 'daemonUnreachable' | null;
+}
+
+export type StagedCopyKind = 'binary' | 'runtime';
+
+/**
+ * One collector artifact left in a container's `/tmp` by an earlier attach.
+ *
+ * A staged build is a pair: the executable and, for musl, the directory holding the C++
+ * runtime. Both are content-addressed by the same identity, which is what lets the host keep
+ * one build and delete the rest without splitting a pair.
+ */
+export interface StagedCollectorCopy {
+  /** Absolute path inside the container. */
+  path: string;
+  kind: StagedCopyKind;
+  /** Allocated disk usage, as `du` reports it. */
+  bytes: number;
+  /** Null when the image's tooling could not report an mtime. */
+  ageSeconds?: number | null;
+  identity: string;
+}
+
+/** What one running container holds, and what a prune would free. */
+export interface ContainerStaging {
+  container: string;
+  image: string;
+  totalBytes: number;
+  /** Everything except the newest build — the number on the Prune button. */
+  prunableBytes: number;
+  copies: StagedCollectorCopy[];
+  /**
+   * Set when the container could not be measured, e.g. a distroless image with no shell. One
+   * such row does not fail the others.
+   */
+  error?: string | null;
 }
 
 /** A running container the rail can expand into its attachable processes. */
@@ -623,4 +679,73 @@ export interface SessionRequest {
   targetRuntime?: string | null;
   /** Name or id of a Docker container the target runs in; omitted means a local process. */
   container?: string | null;
+}
+
+export interface DumpAnalysis {
+  id: string;
+  path: string;
+  durationMs: number;
+  objectCount: number;
+  totalBytes: number;
+  freeBytes: number;
+  types: DumpType[];
+  notices: string[];
+}
+
+export interface DumpType {
+  methodTable: string;
+  typeName: string;
+  objectCount: number;
+  totalBytes: number;
+}
+
+export interface DumpMethodTable extends DumpType {
+  baselineCount: number | null;
+  baselineBytes: number | null;
+}
+
+export interface DumpRoots {
+  samplesChecked: number;
+  paths: DumpRootPath[];
+}
+
+export interface DumpObject {
+  address: string;
+  sizeBytes: number;
+}
+
+export interface DumpRootFrame {
+  address: string;
+  typeName: string;
+  staticField: string | null;
+}
+
+export interface DumpRootPath {
+  address: string;
+  frames: DumpRootFrame[];
+  applicationFrameIndex: number | null;
+  stackMethod: string | null;
+  reference: DumpReference | null;
+  trace: string;
+  traceTruncated: boolean;
+}
+
+export interface DumpReference {
+  methodTable: string;
+  typeName: string;
+  assemblyPath: string | null;
+  fields: string[];
+}
+
+export interface DumpSourceLocation {
+  sourceFile: string;
+  sourceLine: number;
+  methodName: string;
+  isMethodLocation: boolean;
+  sha256: string | null;
+}
+
+export interface SourcePreview {
+  firstLine: number;
+  lines: string[];
 }

@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 import { MOCK_ENABLED, mockApi, startMockStream } from './mock';
@@ -6,9 +6,16 @@ import type {
   Capabilities,
   CollectorMessage,
   CollectorLocation,
+  ContainerStaging,
+  DockerCollectorVariant,
   DockerContainer,
   DockerStatus,
   DotnetProcessInfo,
+  DumpAnalysis,
+  DumpObject,
+  DumpReference,
+  DumpRoots,
+  DumpSourceLocation,
   EnvironmentInfo,
   PlaybackStatusEvent,
   RecordingSummary,
@@ -16,6 +23,7 @@ import type {
   SessionSnapshot,
   SessionStatusEvent,
   Settings,
+  SourcePreview,
 } from './types';
 
 /**
@@ -66,9 +74,19 @@ const realApi = {
   // Containerised targets. Discovery is a separate call because staging the Linux collector into
   // a container is real work and must not ride on the five-second process-list refresh.
   dockerStatus: () => call<DockerStatus>('get_docker_status'),
+  // One `docker exec` per running container, so this is asked for when the container-support
+  // view opens rather than as part of the status probe at startup.
+  dockerStaging: () => call<ContainerStaging[]>('get_docker_staging'),
+  // Keeps the newest staged build and removes the rebuild leftovers in one container.
+  pruneDockerStaging: (container: string) =>
+    call<ContainerStaging>('prune_docker_staging', { container }),
   listDockerContainers: () => call<DockerContainer[]>('list_docker_containers'),
-  listContainerProcesses: (container: string) =>
-    call<DotnetProcessInfo[]>('list_container_processes', { container }),
+  // Bundles a published musl build's C++ runtime so bare Alpine images can start it. Slow when
+  // it has to pull the runtime image, so it is a command of its own and reports the repaired row.
+  repairCollectorVariant: (rid: string) =>
+    call<DockerCollectorVariant>('repair_collector_variant', { rid }),
+  listContainerProcesses: (container: string, fast = false) =>
+    call<DotnetProcessInfo[]>('list_container_processes', { container, fast }),
   getCapabilities: () => call<Capabilities>('get_capabilities'),
   startSession: (request: SessionRequest) => call<SessionSnapshot>('start_session', { request }),
   stopSession: (sessionId: string) => call<void>('stop_session', { sessionId }),
@@ -106,6 +124,33 @@ const realApi = {
 
 /** Every backend call the app makes, routed to the real host or the dev mock. */
 export const api: typeof realApi = MOCK_ENABLED ? mockApi : realApi;
+
+function dumpProgress(receive: (message: string) => void) {
+  const channel = new Channel<string>();
+  channel.onmessage = receive;
+  return channel;
+}
+
+export const dumpApi = {
+  pick: (kind?: 'assembly' | 'source') => call<string | null>('pick_dump', { kind: kind ?? null }),
+  analyze: (path: string, progress: (message: string) => void) =>
+    call<DumpAnalysis | null>('analyze_dump', { path, progress: dumpProgress(progress) }),
+  sampleObjects: (report: DumpAnalysis, methodTable: string, minBytes: number, progress: (message: string) => void) =>
+    call<DumpObject[] | null>('sample_dump_objects', {
+      path: report.path, dumpId: report.id, methodTable, minBytes, progress: dumpProgress(progress),
+    }),
+  inspectRoots: (report: DumpAnalysis, addresses: string[], progress: (message: string) => void) =>
+    call<DumpRoots | null>('inspect_dump_roots', {
+      path: report.path, dumpId: report.id, addresses, progress: dumpProgress(progress),
+    }),
+  inspectReference: (report: DumpAnalysis, parent: string, child: string | null) =>
+    call<DumpReference | null>('inspect_dump_reference', { path: report.path, dumpId: report.id, parent, child }),
+  resolveSource: (report: DumpAnalysis, assembly: string, methodTable: string, typeName: string, methodName: string | null) =>
+    call<DumpSourceLocation>('resolve_dump_source', { path: report.path, dumpId: report.id, assembly, methodTable, typeName, methodName }),
+  previewSource: (path: string, line: number, sha256?: string | null) =>
+    call<SourcePreview>('preview_dump_source', { path, line, sha256: sha256 ?? null }),
+  cancel: () => call<void>('cancel_dump_analysis'),
+};
 
 export interface MessageBatch {
   sessionId: string;

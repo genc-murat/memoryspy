@@ -33,7 +33,11 @@ pub const EVENT_STATUS: &str = "memoryspy://status";
 /// supplies [`TauriSink`], which forwards to the webview; tests supply a recorder, which is
 /// how the host/collector contract is verified against a real .NET process without a GUI.
 pub trait EventSink: Send + Sync + 'static {
-    fn messages(&self, session_id: &str, messages: Vec<serde_json::Value>);
+    /// One batch of collector envelopes, as the raw JSON lines they arrived in.
+    ///
+    /// Raw text rather than parsed values: an envelope is already JSON, and every consumer
+    /// either forwards it as-is (the webview, the recorder) or looks one field up in it.
+    fn messages(&self, session_id: &str, messages: Vec<String>);
     fn log(&self, session_id: &str, level: &str, message: &str);
     fn status(
         &self,
@@ -61,15 +65,17 @@ impl TauriSink {
 }
 
 impl EventSink for TauriSink {
-    fn messages(&self, session_id: &str, messages: Vec<serde_json::Value>) {
+    fn messages(&self, session_id: &str, messages: Vec<String>) {
         if messages.is_empty() {
             return;
         }
 
-        let _ = self.app.emit(
-            EVENT_MESSAGES,
-            serde_json::json!({ "sessionId": session_id, "messages": messages }),
-        );
+        // The batch payload splices the lines as they are and `emit_str` hands that JSON to
+        // the webview without serialising it again — one pass over the text instead of a parse
+        // into a document tree and a second print on the way out.
+        let _ = self
+            .app
+            .emit_str(EVENT_MESSAGES, messages_payload(session_id, &messages));
     }
 
     fn log(&self, session_id: &str, level: &str, message: &str) {
@@ -182,7 +188,7 @@ fn sibling_executable(dir: &Path) -> Option<PathBuf> {
 /// argument; a framework-dependent layout launches through `dotnet` with the assembly as the
 /// first argument. Either way the caller appends its subcommand (`list`, `capabilities`,
 /// `watch`) exactly as before.
-fn resolve_launch(location: &CollectorLocation) -> Result<(String, Vec<String>), String> {
+pub(crate) fn resolve_launch(location: &CollectorLocation) -> Result<(String, Vec<String>), String> {
     if let Some(executable) = &location.executable_path {
         return Ok((executable.clone(), Vec::new()));
     }
@@ -774,13 +780,14 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Wraps a message the *host* contributes in the collector's envelope.
+/// Wraps a message the *host* contributes in the collector's envelope, as serialized JSON.
 ///
 /// Copying a container capture out is a host concern, but the webview already ingests one
 /// message channel, so the answer travels on that channel instead of a second event the UI
 /// would have to learn. `seq` is 0 because host messages are outside the collector's sequence,
-/// which only orders its own output.
-fn host_message(message_type: &str, data: serde_json::Value) -> serde_json::Value {
+/// which only orders its own output. Returned as text because that is what every consumer of
+/// the message channel now takes.
+fn host_message(message_type: &str, data: serde_json::Value) -> String {
     serde_json::json!({
         "v": 1,
         "seq": 0,
@@ -788,6 +795,7 @@ fn host_message(message_type: &str, data: serde_json::Value) -> serde_json::Valu
         "type": message_type,
         "data": data,
     })
+    .to_string()
 }
 
 /// Publishes a host-originated message on the channel the UI already reads, and records it.
@@ -902,15 +910,7 @@ pub fn start_session(
     let (program, launcher_arguments) = match container {
         Some(container) => {
             let staged = crate::docker::ensure_collector(container)?;
-            (
-                crate::docker::cli(),
-                vec![
-                    "exec".to_string(),
-                    "-i".to_string(),
-                    container.to_string(),
-                    staged.path,
-                ],
-            )
+            (crate::docker::cli(), staged.exec_arguments(container, true))
         }
         None => resolve_launch(location)?,
     };
@@ -1078,11 +1078,73 @@ fn open_recording(
     }
 }
 
+/// The `type` of one line of the collector's stdout, or [`None`] when the line is not JSON.
+///
+/// The pump forwards and records every line as the raw text it already is, so the one field
+/// the host itself acts on is found with a one-field skim instead of building the whole
+/// document in memory. A line the skim cannot classify falls back to a full parse, so any odd
+/// line means exactly what it meant when everything was parsed: valid JSON without a string
+/// `type` reads as `"unknown"`, and only text that is not JSON at all is refused.
+pub fn message_type_of(line: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct EnvelopeHeader {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+
+    if let Ok(header) = serde_json::from_str::<EnvelopeHeader>(line) {
+        return Some(header.kind.unwrap_or_else(|| "unknown".to_string()));
+    }
+
+    // The skim refuses what a full parse still accepts — a duplicate `type` key, a `type` that
+    // is not a string, JSON that is not an object — so those rare lines get the old treatment
+    // rather than a new opinion of their own.
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    Some(
+        value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
+/// The webview payload for one batch of collector envelopes, spliced together from raw lines.
+///
+/// This is the single-pass alternative to assembling a `serde_json::Value` tree out of
+/// everything the collector said and having it printed again on the way to the webview: the
+/// lines are already JSON, so the batch object is built around them as text and handed to
+/// `emit_str`, which sends it as-is. The frontend sees exactly the payload shape it always
+/// has — `{ "sessionId": …, "messages": [ … ] }`.
+pub fn messages_payload(session_id: &str, messages: &[String]) -> String {
+    let content: usize = messages.iter().map(String::len).sum();
+    let mut payload = String::with_capacity(content + session_id.len() + 48);
+    payload.push_str("{\"sessionId\":");
+    // A session id is a plain identifier, but it is quoted and escaped like any other string.
+    match serde_json::to_string(session_id) {
+        Ok(id) => payload.push_str(&id),
+        Err(_) => payload.push_str("\"\""),
+    }
+    payload.push_str(",\"messages\":[");
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            payload.push(',');
+        }
+        payload.push_str(message);
+    }
+    payload.push_str("]}");
+    payload
+}
+
 /// Reads the collector's stdout, batches messages and forwards them to the frontend.
 ///
 /// Batching is not cosmetic: a heavily collecting runtime emits hundreds of GC and
 /// allocation events per second, and one IPC round trip per event would saturate the webview
 /// while adding nothing the UI can render (it repaints at most once per frame).
+///
+/// Each line is handled as the raw JSON it is: skimmed for its `type`, written to the
+/// recording exactly as it arrived, and folded into the batch payload as text. Nothing
+/// parses a message into a document tree and prints it again on its way out.
 fn spawn_stdout_pump(
     sink: Arc<dyn EventSink>,
     inner: Arc<SessionInner>,
@@ -1105,7 +1167,7 @@ fn spawn_stdout_pump(
     });
 
     thread::spawn(move || {
-        let mut batch: Vec<serde_json::Value> = Vec::with_capacity(MESSAGE_BATCH_SIZE);
+        let mut batch: Vec<String> = Vec::with_capacity(MESSAGE_BATCH_SIZE);
         let mut last_flush = Instant::now();
 
         loop {
@@ -1122,38 +1184,33 @@ fn spawn_stdout_pump(
                 Err(RecvTimeoutError::Disconnected) => break,
             };
 
-            let line = line.trim();
+            // `lines()` already removed the line ending; the trim only guards against stray
+            // whitespace from something other than the collector.
+            let line = if line.len() == line.trim().len() {
+                line
+            } else {
+                line.trim().to_string()
+            };
             if line.is_empty() {
                 continue;
             }
 
-            let value: serde_json::Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_) => {
-                    // Unparseable output is a collector bug, not a reason to stop.
-                    inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            let Some(message_type) = message_type_of(&line) else {
+                // Unparseable output is a collector bug, not a reason to stop.
+                inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
             };
 
             // Recorded before dispatch, and independently of it: a recording is the raw
             // evidence, so it must not depend on which message types this build of the host
-            // happens to understand.
+            // happens to understand. The line reaches the file exactly as it was read.
             if let Some(recorder) = inner.recorder() {
-                recorder.record_message(&value);
+                recorder.record_message(&line);
             }
 
             inner.stats.messages.fetch_add(1, Ordering::Relaxed);
 
-            let message_type = value
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("unknown");
-            if let Ok(mut counts) = inner.message_counts.lock() {
-                *counts.entry(message_type.to_string()).or_insert(0) += 1;
-            }
-
-            match message_type {
+            match message_type.as_str() {
                 "counter.sample" => {
                     inner.stats.counters.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1175,7 +1232,11 @@ fn spawn_stdout_pump(
                 _ => {}
             }
 
-            batch.push(value);
+            if let Ok(mut counts) = inner.message_counts.lock() {
+                *counts.entry(message_type).or_insert(0) += 1;
+            }
+
+            batch.push(line);
 
             if batch.len() >= MESSAGE_BATCH_SIZE || last_flush.elapsed() >= MESSAGE_BATCH_INTERVAL {
                 sink.messages(&inner.id, std::mem::take(&mut batch));
@@ -1325,4 +1386,66 @@ fn spawn_stderr_pump(
             sink.log(&inner.id, "debug", line);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The batch payload is assembled as text, so its shape is guarded here: it is the
+    /// frontend's contract — `{ "sessionId": …, "messages": [ … ] }` with each envelope
+    /// exactly as the collector wrote it.
+    #[test]
+    fn the_batch_payload_keeps_the_shape_the_webview_reads() {
+        let payload = messages_payload(
+            "s-1",
+            &[
+                "{\"type\":\"counter.sample\",\"data\":{}}".to_string(),
+                "{\"type\":\"gc.event\"}".to_string(),
+            ],
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(parsed["sessionId"], "s-1");
+        assert_eq!(parsed["messages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(parsed["messages"][0]["type"], "counter.sample");
+        assert_eq!(parsed["messages"][1]["type"], "gc.event");
+    }
+
+    /// The payload is text, so a session id that needs escaping must still round-trip.
+    #[test]
+    fn the_session_id_is_quoted_and_escaped_like_any_other_string() {
+        let payload = messages_payload("a\"b", &[]);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(parsed["sessionId"], "a\"b");
+    }
+
+    /// The skim reads the same `type` a full parse would.
+    #[test]
+    fn the_skim_reads_the_type_of_a_line() {
+        assert_eq!(
+            message_type_of(r#"{"v":1,"type":"allocation.sample","data":{"types":[]}}"#).as_deref(),
+            Some("allocation.sample")
+        );
+    }
+
+    /// Odd lines keep the meaning they had when everything was parsed: valid JSON without a
+    /// string `type` is `"unknown"` — including a `type` that is not a string, which only a
+    /// full parse can tell apart from malformed text.
+    #[test]
+    fn a_line_without_a_string_type_reads_as_unknown() {
+        assert_eq!(message_type_of(r#"{"ts":1}"#).as_deref(), Some("unknown"));
+        assert_eq!(message_type_of(r#"[1,2]"#).as_deref(), Some("unknown"));
+        assert_eq!(
+            message_type_of(r#"{"type":5,"seq":2}"#).as_deref(),
+            Some("unknown")
+        );
+    }
+
+    /// Only text that is not JSON at all is refused.
+    #[test]
+    fn only_text_that_is_not_json_is_refused() {
+        assert_eq!(message_type_of("not json"), None);
+        assert_eq!(message_type_of(r#"{"type":"x""#), None);
+    }
 }

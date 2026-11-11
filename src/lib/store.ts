@@ -276,7 +276,14 @@ export class MetricsStore {
         break;
       case 'gc.summary': {
         const summary = unwrap<GcSummaryData>(message);
-        if (summary) this.gcSummary.push(summary);
+        if (summary) {
+          this.gcSummary.push(summary);
+          // Capped here, not only in `trim()`: trim runs when the history setting changes, so
+          // without this a long session grows the buffer without bound. Same bound as `trim()`.
+          if (this.gcSummary.length > this.historyPoints) {
+            this.gcSummary.splice(0, this.gcSummary.length - this.historyPoints);
+          }
+        }
         break;
       }
       case 'log': {
@@ -449,12 +456,21 @@ export class MetricsStore {
     };
 
     this.heapHistory.push(point);
+    // Capped here rather than only in `trim()` — see `gcSummary`. Same bound as `trim()`.
+    if (this.heapHistory.length > this.historyPoints) {
+      this.heapHistory.splice(0, this.heapHistory.length - this.historyPoints);
+    }
     this.heap.set('current', point);
   }
 
   private applyGcEvent(data: GcEventData | null, at: number) {
     if (!data) return;
     this.gcEvents.push({ ...data, seq: ++this.seq, receivedAt: at });
+    // A collecting runtime raises several of these per second, so of the three buffers this is
+    // the one that grew fastest before the cap was enforced here. Same bound as `trim()`.
+    if (this.gcEvents.length > 400) {
+      this.gcEvents.splice(0, this.gcEvents.length - 400);
+    }
   }
 
   private pushLog(at: number, source: 'collector' | 'host', data: { level?: string; message?: string }) {

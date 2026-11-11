@@ -18,6 +18,8 @@ export interface PanelContext {
   sessionId: string | null;
   settings: import('../lib/types').Settings;
   collector: import('../lib/types').CollectorLocation;
+  /** Host Docker status, read at startup and on demand by the container-support view. */
+  docker: import('../lib/types').DockerStatus | null;
   capabilities: Capabilities | null;
   recordingsDir: string;
   /** The recording being replayed, if any. */
@@ -26,6 +28,7 @@ export interface PanelContext {
   recordingPath: string | null;
   /** Bumped when a recording finishes, so the library re-reads the folder. */
   recordingsToken: number;
+  dumpAnalysis: ReturnType<typeof import('../lib/useDumpAnalysis').useDumpAnalysis>;
   onReplayRecording: (path: string) => void;
   onOpenTarget: (target?: string) => void;
   onResetCounters: () => void;
@@ -33,6 +36,8 @@ export interface PanelContext {
   onTakeSnapshot: () => void;
   onSaveSettings: (settings: import('../lib/types').Settings) => Promise<void>;
   onRefreshCollector: () => Promise<void>;
+  /** Re-reads Docker reachability and the published collector inventory. */
+  onRefreshDocker: () => Promise<void>;
 }
 
 export interface PanelDefinition {
@@ -89,6 +94,14 @@ export const PANELS: PanelDefinition[] = [
     component: HeapSnapshotPanelLazy,
   },
   {
+    id: 'dump',
+    label: 'Dump Analysis',
+    hint: 'Managed heap statistics from a saved .NET memory dump.',
+    requires: [],
+    consumes: [],
+    component: DumpPanelLazy,
+  },
+  {
     id: 'insights',
     label: 'Diagnosis',
     hint: 'What the numbers mean and what to check next.',
@@ -119,6 +132,14 @@ export const PANELS: PanelDefinition[] = [
     requires: [],
     consumes: [],
     component: SettingsPanelLazy,
+  },
+  {
+    id: 'container-support',
+    label: 'Container Support',
+    hint: 'Docker reachability and published collector builds.',
+    requires: [],
+    consumes: [],
+    component: ContainerSupportPanelLazy,
   },
 ];
 
@@ -186,6 +207,7 @@ export function panelById(id: string): PanelDefinition | undefined {
 // The imports at the bottom keep the registry readable: the mapping from view id to
 // component is the interesting part, and it should not be buried under a wall of imports.
 import { OverviewPanel } from '../components/OverviewPanel';
+import { DumpPanel } from '../components/DumpPanel';
 import { TypesPanel } from '../components/TypesPanel';
 import { CallSitesPanel } from '../components/CallSitesPanel';
 import { GcPanel } from '../components/GcPanel';
@@ -194,6 +216,7 @@ import { InsightsPanel } from '../components/InsightsPanel';
 import { LogPanel } from '../components/LogPanel';
 import { RecordingsPanel } from '../components/RecordingsPanel';
 import { SettingsPanel } from '../components/SettingsPanel';
+import { ContainerSupportPanel } from '../components/ContainerSupportPanel';
 
 function OverviewPanelLazy({ store, settings, activeRecordingPath, onOpenTarget }: PanelContext) {
   return (
@@ -212,6 +235,10 @@ function TypesPanelLazy({ store }: PanelContext) {
 
 function CallSitesPanelLazy({ store }: PanelContext) {
   return <CallSitesPanel store={store} />;
+}
+
+function DumpPanelLazy({ dumpAnalysis, store }: PanelContext) {
+  return <DumpPanel analysis={dumpAnalysis} traces={store.allocationSites} />;
 }
 
 function GcPanelLazy({ store }: PanelContext) {
@@ -263,4 +290,8 @@ function SettingsPanelLazy({ settings, collector, capabilities, onSaveSettings, 
       onRefreshCollector={onRefreshCollector}
     />
   );
+}
+
+function ContainerSupportPanelLazy({ docker, onRefreshDocker }: PanelContext) {
+  return <ContainerSupportPanel docker={docker} onRefresh={onRefreshDocker} />;
 }

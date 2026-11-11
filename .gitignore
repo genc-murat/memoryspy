@@ -33,3 +33,4 @@ src-tauri/resources/collector-docker/*
 *.sln
 *.sw?
 .mimosa/
+.cloud-attachments/

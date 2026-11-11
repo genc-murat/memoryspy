@@ -17,8 +17,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "sync"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` lets the recording reader hand envelopes on as the raw JSON text they already
+# are instead of parsing each one into a document tree just to print it again.
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 
 [profile.release]

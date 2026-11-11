@@ -18,7 +18,12 @@
 //!
 //! `MEMORYSPY_TEST_CONTAINER` still works, and then nothing is created or removed: point it at a
 //! running container and the tests use that target instead. `MEMORYSPY_TEST_IMAGE` overrides the
-//! base image.
+//! base image; `MEMORYSPY_TEST_MUSL_IMAGE` overrides the bare musl image used by the Alpine test.
+//!
+//! The Alpine test is optional in the other direction: when no musl collector has been published
+//! for the daemon's architecture it says so and returns, because a glibc-only setup legitimately
+//! never builds one. Once the musl binary *is* published, that test must pass — a publish without
+//! the `libs/` runtime is exactly the broken artifact it exists to catch.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -308,7 +313,7 @@ impl Fixture {
         let mut last_error;
 
         loop {
-            match docker::list_processes(&self.container) {
+            match docker::list_processes(&self.container, false) {
                 Ok(processes) => {
                     let candidates: Vec<_> = processes
                         .iter()
@@ -364,8 +369,12 @@ struct RecordingSink {
 }
 
 impl EventSink for RecordingSink {
-    fn messages(&self, _session_id: &str, messages: Vec<Value>) {
-        self.messages.lock().unwrap().extend(messages);
+    fn messages(&self, _session_id: &str, messages: Vec<String>) {
+        // The pipeline hands on raw JSON lines; the assertions below work on values.
+        let parsed = messages.iter().map(|message| {
+            serde_json::from_str(message).expect("the pipeline forwards valid JSON")
+        });
+        self.messages.lock().unwrap().extend(parsed);
     }
 
     fn log(&self, _session_id: &str, level: &str, message: &str) {
@@ -449,6 +458,397 @@ fn session_request(container: &str, pid: i32) -> SessionRequest {
 // ---------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------
+
+/// A bare Alpine image has musl but not the C++ runtime the .NET host links against.
+///
+/// The published musl collector is not self-contained with respect to `libstdc++.so.6` and
+/// `libgcc_s.so.1`; it carries them in a `libs/` directory and the transport stages that directory
+/// with `LD_LIBRARY_PATH`. Without it, staging fails with "Error loading shared library" — the
+/// failure this test pins. The image runs no .NET process on purpose: `version` and
+/// `capabilities` prove the binary starts, which is the whole question here.
+#[test]
+fn a_bare_alpine_container_can_run_the_bundled_musl_collector() {
+    let status = docker::status();
+    if !status.available {
+        eprintln!(
+            "skipping: Docker is not reachable ({}).",
+            status.error.as_deref().unwrap_or("no error reported")
+        );
+        return;
+    }
+
+    let rid = daemon_rid().expect("the daemon must report a supported architecture");
+    let musl_rid = match rid {
+        "linux-arm64" => "linux-musl-arm64",
+        "linux-x64" => "linux-musl-x64",
+        other => panic!("the daemon reports an unsupported architecture: {other}"),
+    };
+
+    // The musl build is optional: a machine that only needs glibc never publishes it. Skip there,
+    // but never skip a machine where the binary *was* published — that is the configuration under
+    // test, and a publish without `libs/` has to fail rather than quietly skip the only check that
+    // would notice the missing runtime.
+    if !docker::staged_rids()
+        .iter()
+        .any(|candidate| candidate == musl_rid)
+    {
+        eprintln!(
+            "skipping: no musl collector was published for {musl_rid}; run \
+             `npm run collector:docker -- {rid} musl`."
+        );
+        return;
+    }
+
+    // The rail and the diagnostics view read the same inventory, so a published musl binary
+    // without its `libs/` directory would make the panel claim readiness for a build that cannot
+    // start here. Assert the table agrees with the artifacts this test is about to use.
+    let variant = status
+        .collectors
+        .iter()
+        .find(|variant| variant.rid == musl_rid)
+        .unwrap_or_else(|| panic!("the diagnostics table did not list {musl_rid}"));
+    assert!(
+        variant.published,
+        "{musl_rid} was not reported as published"
+    );
+    assert!(
+        !variant.runtime_missing,
+        "{musl_rid} is published with libs/, but the diagnostics table reports its runtime as missing"
+    );
+
+    let image =
+        std::env::var("MEMORYSPY_TEST_MUSL_IMAGE").unwrap_or_else(|_| "alpine:3.22".to_string());
+    let name = format!(
+        "memoryspy-test-musl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis()
+    );
+    let _ = docker(&["rm", "-f", &name]);
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &name,
+        "--platform",
+        if rid == "linux-arm64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        },
+        &image,
+        "sleep",
+        "300",
+    ])
+    .unwrap_or_else(|error| panic!("could not start {image}: {error}"));
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = docker(&["rm", "-f", &self.0]);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+
+    let staged = docker::ensure_collector(&name)
+        .unwrap_or_else(|error| panic!("the musl collector did not run in bare {image}: {error}"));
+    assert!(
+        staged.rid == musl_rid,
+        "a musl image was given the {} collector",
+        staged.rid
+    );
+    assert!(
+        staged
+            .library_path
+            .as_deref()
+            .is_some_and(|path| path.starts_with("/tmp/")),
+        "the collector was staged without the C++ runtime it needs: {staged:?}"
+    );
+
+    // The libc is detected before staging, so the 85 MB glibc build must never have been copied
+    // into this container. Without detection it lands in /tmp, fails its exec, and stays there.
+    let entries = docker(&["exec", &name, "ls", "-1", "/tmp"])
+        .expect("the staged paths must be listable in Alpine");
+    let glibc_prefix = format!("memoryspy-collector-{rid}-");
+    assert!(
+        !entries
+            .lines()
+            .any(|entry| entry.starts_with(&glibc_prefix)),
+        "the glibc collector was copied into a musl image before the musl build: {entries}"
+    );
+    let musl_prefix = format!("memoryspy-collector-{musl_rid}-");
+    assert!(
+        entries.lines().any(|entry| entry.starts_with(&musl_prefix)),
+        "the musl collector was not staged: {entries}"
+    );
+}
+
+/// A long-lived container keeps a C++ runtime directory per collector build unless cleanup
+/// prunes the old ones.
+///
+/// The executable's cleanup prefix (`memoryspy-collector-<rid>-`) cannot match a runtime
+/// directory (`memoryspy-collector-libs-<rid>-<identity>`), so this pins the second prefix the
+/// host now passes and the collector now acts on. The grace period is part of the contract: a
+/// directory older than a day goes, the pair this session uses stays even if it is old.
+#[test]
+fn cleanup_prunes_old_collector_runtime_directories() {
+    let status = docker::status();
+    if !status.available {
+        eprintln!(
+            "skipping: Docker is not reachable ({}).",
+            status.error.as_deref().unwrap_or("no error reported")
+        );
+        return;
+    }
+
+    let rid = daemon_rid().expect("the daemon must report a supported architecture");
+    let musl_rid = match rid {
+        "linux-arm64" => "linux-musl-arm64",
+        "linux-x64" => "linux-musl-x64",
+        other => panic!("the daemon reports an unsupported architecture: {other}"),
+    };
+
+    // Only a musl collector has a runtime directory to prune. A glibc-only checkout skips this
+    // test for the same reason the Alpine test does.
+    if !docker::staged_rids()
+        .iter()
+        .any(|candidate| candidate == musl_rid)
+    {
+        eprintln!(
+            "skipping: no musl collector was published for {musl_rid}; run \
+             `npm run collector:docker -- {rid} musl`."
+        );
+        return;
+    }
+
+    let image =
+        std::env::var("MEMORYSPY_TEST_MUSL_IMAGE").unwrap_or_else(|_| "alpine:3.22".to_string());
+    let name = format!(
+        "memoryspy-test-prune-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis()
+    );
+    let _ = docker(&["rm", "-f", &name]);
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &name,
+        "--platform",
+        if rid == "linux-arm64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        },
+        &image,
+        "sleep",
+        "300",
+    ])
+    .unwrap_or_else(|error| panic!("could not start {image}: {error}"));
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = docker(&["rm", "-f", &self.0]);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+
+    // A runtime directory from a previous build: the same shape `docker cp` creates, with both
+    // libraries present, made old enough to be outside the grace period. The mtime of the
+    // directory itself is what cleanup compares, and creating the files just moved it, so it is
+    // set afterwards.
+    let stale = format!(
+        "memoryspy-collector-libs-{musl_rid}-stale{}",
+        std::process::id()
+    );
+    docker(&[
+        "exec",
+        &name,
+        "sh",
+        "-c",
+        &format!(
+            "mkdir -p /tmp/{stale} \
+             && touch /tmp/{stale}/libstdc++.so.6 /tmp/{stale}/libgcc_s.so.1 \
+             && touch -t 202001010000 /tmp/{stale}"
+        ),
+    ])
+    .expect("the stale runtime fixture must be creatable in Alpine");
+
+    let staged = docker::ensure_collector(&name)
+        .unwrap_or_else(|error| panic!("the musl collector did not stage in {image}: {error}"));
+    let current = staged
+        .library_path
+        .as_deref()
+        .expect("a musl collector must be staged with its runtime directory");
+    assert!(
+        current.starts_with(&format!("/tmp/memoryspy-collector-libs-{musl_rid}-")),
+        "the runtime was staged somewhere cleanup will not recognise: {current}"
+    );
+
+    let entries = docker(&["exec", &name, "ls", "-1", "/tmp"])
+        .expect("the staged paths must be listable in Alpine");
+    assert!(
+        !entries.lines().any(|entry| entry == stale),
+        "an old runtime directory survived cleanup: {entries}"
+    );
+    let current_name = current.rsplit('/').next().unwrap_or(current);
+    assert!(
+        entries.lines().any(|entry| entry == current_name),
+        "cleanup removed the runtime directory this session is about to use: {entries}"
+    );
+
+    // The current pair must survive even when it is past the grace period: a long session is not
+    // stale just because it started yesterday. Cleanup is invoked directly here with the same
+    // environment the host supplies, after aging the directory it must keep.
+    docker(&["exec", &name, "touch", "-t", "202001010000", current])
+        .expect("the current runtime directory must be ageable");
+    let binary_prefix = format!("memoryspy-collector-{musl_rid}-");
+    let libraries_prefix = format!("memoryspy-collector-libs-{musl_rid}-");
+    docker(&[
+        "exec",
+        "-e",
+        &format!("LD_LIBRARY_PATH={current}"),
+        &name,
+        &staged.path,
+        "cleanup",
+        &binary_prefix,
+        &libraries_prefix,
+    ])
+    .expect("cleanup must run with the session's library path");
+
+    let entries = docker(&["exec", &name, "ls", "-1", "/tmp"])
+        .expect("the staged paths must be listable in Alpine");
+    assert!(
+        entries.lines().any(|entry| entry == current_name),
+        "cleanup removed the runtime directory of a session older than its grace period: {entries}"
+    );
+}
+
+/// What the container-support view needs: real sizes from inside a container, and a prune that
+/// removes a whole build (executable *and* runtime directory) without touching the newest one.
+#[test]
+fn staged_builds_are_measured_and_pruned() {
+    let status = docker::status();
+    if !status.available {
+        eprintln!(
+            "skipping: Docker is not reachable ({}).",
+            status.error.as_deref().unwrap_or("no error reported")
+        );
+        return;
+    }
+
+    let rid = daemon_rid().expect("the daemon must report a supported architecture");
+    let musl_rid = match rid {
+        "linux-arm64" => "linux-musl-arm64",
+        "linux-x64" => "linux-musl-x64",
+        other => panic!("the daemon reports an unsupported architecture: {other}"),
+    };
+
+    let image =
+        std::env::var("MEMORYSPY_TEST_MUSL_IMAGE").unwrap_or_else(|_| "alpine:3.22".to_string());
+    let name = format!(
+        "memoryspy-test-staging-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis()
+    );
+    let _ = docker(&["rm", "-f", &name]);
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &name,
+        "--platform",
+        if rid == "linux-arm64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        },
+        &image,
+        "sleep",
+        "300",
+    ])
+    .unwrap_or_else(|error| panic!("could not start {image}: {error}"));
+
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = docker(&["rm", "-f", &self.0]);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+
+    let current = "a".repeat(64);
+    let previous = "b".repeat(64);
+    let current_binary = format!("memoryspy-collector-{musl_rid}-{current}");
+    let current_libs = format!("memoryspy-collector-libs-{musl_rid}-{current}");
+    let previous_binary = format!("memoryspy-collector-{musl_rid}-{previous}");
+    let previous_libs = format!("memoryspy-collector-libs-{musl_rid}-{previous}");
+
+    // Two builds of the same shape staging produces. The previous one is old enough that the
+    // newest build is unambiguous, while the current one keeps a fresh mtime.
+    docker(&[
+        "exec",
+        &name,
+        "sh",
+        "-c",
+        &format!(
+            "mkdir -p /tmp/{current_libs} /tmp/{previous_libs} \
+             && dd if=/dev/zero of=/tmp/{current_binary} bs=1024 count=256 2>/dev/null \
+             && dd if=/dev/zero of=/tmp/{current_libs}/libstdc++.so.6 bs=1024 count=8 2>/dev/null \
+             && dd if=/dev/zero of=/tmp/{previous_binary} bs=1024 count=256 2>/dev/null \
+             && dd if=/dev/zero of=/tmp/{previous_libs}/libstdc++.so.6 bs=1024 count=8 2>/dev/null \
+             && touch -t 202001010000 /tmp/{previous_binary} /tmp/{previous_libs}"
+        ),
+    ])
+    .expect("the staged build fixture must be creatable in Alpine");
+
+    let rows = docker::staging_usage().expect("a reachable daemon must be measurable");
+    let before = rows
+        .iter()
+        .find(|row| row.container == name)
+        .unwrap_or_else(|| panic!("{name} was not measured: {rows:#?}"));
+    assert!(before.error.is_none(), "{before:#?}");
+    assert_eq!(before.copies.len(), 4, "{before:#?}");
+    assert!(
+        before.total_bytes >= 512 * 1024,
+        "real sizes must come back, not zeros: {before:#?}"
+    );
+    assert!(
+        before.prunable_bytes > 0 && before.prunable_bytes < before.total_bytes,
+        "only the previous build is prunable: {before:#?}"
+    );
+
+    let after = docker::prune_staging(&name).expect("the previous build must be removable");
+    assert_eq!(after.copies.len(), 2, "{after:#?}");
+    assert!(
+        after.copies.iter().all(|copy| copy.identity == current),
+        "prune kept something other than the newest build: {after:#?}"
+    );
+    assert_eq!(after.prunable_bytes, 0, "{after:#?}");
+    assert!(after.total_bytes < before.total_bytes);
+
+    let entries = docker(&["exec", &name, "ls", "-1", "/tmp"])
+        .expect("the staged paths must be listable in Alpine");
+    assert!(
+        entries.lines().any(|entry| entry == current_binary)
+            && entries.lines().any(|entry| entry == current_libs),
+        "prune removed the newest pair: {entries}"
+    );
+    assert!(
+        !entries.lines().any(|entry| entry == previous_binary)
+            && !entries.lines().any(|entry| entry == previous_libs),
+        "prune left the previous pair behind: {entries}"
+    );
+}
 
 #[test]
 fn a_container_target_is_listed_and_profiled() {

@@ -20,7 +20,9 @@ import type {
   Capabilities,
   CollectorLocation,
   CollectorMessage,
+  ContainerStaging,
   CounterReading,
+  DockerCollectorVariant,
   DockerContainer,
   DockerStatus,
   DotnetProcessInfo,
@@ -40,6 +42,40 @@ import type {
 const MOCK_DOCKER_DOWN =
   typeof window !== 'undefined' &&
   new URLSearchParams(window.location.search).get('docker') === 'down';
+
+/**
+ * `?mock=1&musl=missing` reviews the container-support warning for a musl build published
+ * without its C++ runtime. The default mock is a glibc-only machine, which is a valid setup and
+ * therefore shows no warning at all.
+ */
+const MOCK_MUSL_MISSING =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('musl') === 'missing';
+
+/**
+ * `?mock=1&repair=fail` reviews the repair failure path. The default exercises the success one:
+ * pressing Repair on the broken variant fixes it, so the whole loop — warning, busy state, then
+ * the table reading good — can be reviewed without a broken publish on the reviewer's machine.
+ */
+const MOCK_REPAIR_FAILS =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('repair') === 'fail';
+
+/// Mutable on purpose: the mock is a stand-in for a host whose files change when a repair runs.
+let mockCollectors: DockerCollectorVariant[] = [
+  { rid: 'linux-arm64', libc: 'glibc', published: true, runtimeMissing: false },
+  { rid: 'linux-x64', libc: 'glibc', published: false, runtimeMissing: false },
+  {
+    rid: 'linux-musl-arm64',
+    libc: 'musl',
+    published: MOCK_MUSL_MISSING,
+    runtimeMissing: MOCK_MUSL_MISSING,
+  },
+  { rid: 'linux-musl-x64', libc: 'musl', published: false, runtimeMissing: false },
+];
+
+const mockStagedRids = () =>
+  mockCollectors.filter((variant) => variant.published).map((variant) => variant.rid);
 
 /**
  * `?mock=1&capture=lost` reviews the rail's "the capture stayed inside the container" state.
@@ -70,6 +106,67 @@ export const MOCK_ENABLED = (() => {
 })();
 
 const MB = 1024 * 1024;
+
+/**
+ * `?mock=1&staging=broken` reviews the row for an image that cannot be measured.
+ *
+ * A distroless container has no shell, so the host cannot run `du` in it even though the
+ * container itself is perfectly valid — the view has to explain that instead of dropping it.
+ */
+const MOCK_STAGING_BROKEN =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('staging') === 'broken';
+
+/** Two builds in one container, so the prune action has something to free. */
+let mockStaging: ContainerStaging[] = [
+  {
+    container: 'orders-api',
+    image: 'orders-api:2.14.0',
+    totalBytes: 2 * (88 * MB + 3 * MB),
+    prunableBytes: 88 * MB + 3 * MB,
+    copies: [
+      {
+        path: '/tmp/memoryspy-collector-libs-linux-musl-arm64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        kind: 'runtime',
+        bytes: 3 * MB,
+        ageSeconds: 240,
+        identity: 'a'.repeat(64),
+      },
+      {
+        path: '/tmp/memoryspy-collector-linux-musl-arm64-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        kind: 'binary',
+        bytes: 88 * MB,
+        ageSeconds: 240,
+        identity: 'a'.repeat(64),
+      },
+      {
+        path: '/tmp/memoryspy-collector-libs-linux-musl-arm64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        kind: 'runtime',
+        bytes: 3 * MB,
+        ageSeconds: 7_200,
+        identity: 'b'.repeat(64),
+      },
+      {
+        path: '/tmp/memoryspy-collector-linux-musl-arm64-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        kind: 'binary',
+        bytes: 88 * MB,
+        ageSeconds: 7_200,
+        identity: 'b'.repeat(64),
+      },
+    ],
+    error: null,
+  },
+  {
+    container: 'billing-worker',
+    image: 'billing-worker:0.9.3',
+    totalBytes: 0,
+    prunableBytes: 0,
+    copies: [],
+    error: MOCK_STAGING_BROKEN
+      ? 'OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH: unknown'
+      : null,
+  },
+];
 
 const SETTINGS: Settings = {
   collectorPath: null,
@@ -1158,6 +1255,7 @@ export const mockApi = {
           available: false,
           version: null,
           stagedRids: [],
+          collectors: mockCollectors,
           problem: 'daemonUnreachable',
           error:
             'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?',
@@ -1165,10 +1263,56 @@ export const mockApi = {
       : {
           available: true,
           version: '29.8.1',
-          stagedRids: ['linux-arm64'],
+          stagedRids: mockStagedRids(),
+          collectors: mockCollectors,
           problem: null,
           error: null,
         },
+  dockerStaging: async (): Promise<ContainerStaging[]> =>
+    MOCK_DOCKER_DOWN ? [] : mockStaging,
+  pruneDockerStaging: async (container: string): Promise<ContainerStaging> => {
+    const row = mockStaging.find((candidate) => candidate.container === container);
+    if (!row) throw new Error(`Unknown container '${container}'.`);
+    if (row.error) throw new Error(row.error);
+
+    // Same contract as the host: keep the newest build's identity, drop the rest.
+    const newest = row.copies.reduce<(typeof row.copies)[number] | null>(
+      (best, copy) =>
+        best === null || (copy.ageSeconds ?? Number.MAX_SAFE_INTEGER) < (best.ageSeconds ?? Number.MAX_SAFE_INTEGER)
+          ? copy
+          : best,
+      null,
+    );
+    if (!newest) return row;
+
+    const copies = row.copies.filter((copy) => copy.identity === newest.identity);
+    const pruned: ContainerStaging = {
+      ...row,
+      copies,
+      totalBytes: copies.reduce((sum, copy) => sum + copy.bytes, 0),
+      prunableBytes: 0,
+    };
+    mockStaging = mockStaging.map((candidate) =>
+      candidate.container === container ? pruned : candidate,
+    );
+    return pruned;
+  },
+  repairCollectorVariant: async (rid: string): Promise<DockerCollectorVariant> => {
+    const variant = mockCollectors.find((candidate) => candidate.rid === rid);
+    if (!variant) throw new Error(`Unknown collector variant '${rid}'.`);
+    if (!MOCK_DOCKER_DOWN && MOCK_REPAIR_FAILS) {
+      throw new Error(
+        'Could not extract the musl C++ runtime for ' +
+          `${rid} from mcr.microsoft.com/dotnet/runtime-deps:10.0-alpine: the daemon did not answer.`,
+      );
+    }
+    if (variant.runtimeMissing) {
+      mockCollectors = mockCollectors.map((candidate) =>
+        candidate.rid === rid ? { ...candidate, runtimeMissing: false } : candidate,
+      );
+    }
+    return mockCollectors.find((candidate) => candidate.rid === rid) ?? variant;
+  },
   listDockerContainers: async (): Promise<DockerContainer[]> =>
     MOCK_DOCKER_DOWN ? [] : DOCKER_CONTAINERS,
   listContainerProcesses: async (container: string): Promise<DotnetProcessInfo[]> =>

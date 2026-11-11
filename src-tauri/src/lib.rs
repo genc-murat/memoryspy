@@ -14,6 +14,9 @@
 pub mod collector;
 mod commands;
 pub mod docker;
+mod dump;
+mod dump_file;
+mod dump_source;
 pub mod recording;
 mod reveal;
 mod settings;
@@ -34,6 +37,7 @@ pub fn run() {
     let check_mode = std::env::args().any(|argument| argument == "--check");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -52,6 +56,15 @@ pub fn run() {
             }
 
             let location = collector::locate_collector();
+
+            // A repaired collector runtime lives in the app's data directory rather than beside
+            // the binary, so a bundled build that replaces this one still has what a repair
+            // pulled over the network. Restored before any status report, because the inventory
+            // (`--check` included) is what decides whether a variant counts as runnable.
+            let data_dir = app.path().app_data_dir().ok();
+            if let Some(data_dir) = data_dir.as_deref() {
+                docker::restore_runtime_cache(data_dir);
+            }
 
             if check_mode {
                 let capabilities = if location.found {
@@ -74,7 +87,12 @@ pub fn run() {
                     "capabilities": capabilities,
                     // Whether the app can reach containerised targets, and whether the Linux
                     // collector those sessions need has been published.
+                    // `runtimeDir` is where a repair keeps the C++ runtime it extracted, so a
+                    // support report carries the path someone would inspect after a failure.
                     "docker": docker::status(),
+                    "collectorRuntimeDir": data_dir
+                        .as_deref()
+                        .map(|dir| dir.join("collector-runtime").display().to_string()),
                     "settings": user_settings,
                 });
 
@@ -96,7 +114,10 @@ pub fn run() {
             commands::refresh_collector,
             commands::list_processes,
             commands::get_docker_status,
+            commands::get_docker_staging,
+            commands::prune_docker_staging,
             commands::list_docker_containers,
+            commands::repair_collector_variant,
             commands::list_container_processes,
             commands::get_capabilities,
             commands::start_session,
@@ -110,6 +131,14 @@ pub fn run() {
             commands::list_recordings,
             commands::delete_recording,
             commands::reveal_in_folder,
+            commands::pick_dump,
+            commands::analyze_dump,
+            commands::sample_dump_objects,
+            commands::inspect_dump_roots,
+            commands::inspect_dump_reference,
+            commands::resolve_dump_source,
+            commands::preview_dump_source,
+            commands::cancel_dump_analysis,
             commands::start_playback,
             commands::pause_playback,
             commands::resume_playback,
@@ -126,6 +155,7 @@ pub fn run() {
             if let tauri::WindowEvent::Destroyed = event {
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
+                    state.dump_analyzer.cancel();
                     // Live sessions first: their stop path writes the recording footer, so it
                     // has to run before anything else claims the shutdown.
                     let handles: Vec<_> =

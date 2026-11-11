@@ -32,7 +32,7 @@ büyüyor**.
 Gereksinimler: .NET SDK 10+ (`dotnet --version`), Node 20+, Rust toolchain, macOS'ta Xcode
 Command Line Tools. Bunlar kaynaktan derlemek için; kurulan uygulamada collector
 self-contained publish edilir ve .NET runtime'ı installer'ın içinde taşındığı için hedef
-makinede `dotnet` gerekmez.
+makinede canlı izleme için `dotnet` gerekmez.
 
 ```bash
 npm install
@@ -73,6 +73,45 @@ Zincir, sızan sözlüğü tutan şeyin *async devam (continuation) durum makine
 onun da thread pool zamanlayıcı kuyruğundan köklendiğini — gösterir. Yani sorun sözlüğün
 kendisi değil, onu yaşatan `Task.Delay(...).ContinueWith(...)` örüntüsüdür.
 
+### Bellek dump dosyasını analiz etme
+
+```powershell
+dotnet-dump collect -p 37880 --output C:\dumps\common1.dmp
+```
+
+MemorySpy’da **Dump Analysis** sekmesini aç. **Browse…** ile dosyayı seç veya dosya yolunu
+yapıştır, ardından **Analyze** düğmesine bas. Sekme yönetilen heap’teki nesne sayısını ve
+kaplanan belleği tür bazında gösterir. Sonuçları filtreleyebilir ve bayta veya nesne sayısına
+göre sıralayabilirsin. Heap’teki boş bloklar ayrı gösterilir.
+
+Sızıntıyı araştırırken aynı süreçten benzer yük altında ayrı dump’lar al. Dosyaları alınma
+sırasıyla aç ve ilkini **Use as baseline** ile seç. **Type growth since baseline** tablosu
+nesne sayısı ve bayt değişimini gösterir. Üç veya daha fazla dump ile her aralıkta büyüyen
+türleri filtreleyebilirsin. Aynı tür adına ait kayıtlar karşılaştırmada birleştirilir.
+Aynı dosya yoluna yeni bir dump yazarsan yeniden analiz et. Önceki özet ve baseline
+karşılaştırmada kalır. Nesne incelemesi için analiz edilen dosyanın sürümü gerekir.
+
+Şüpheli türde **Inspect** düğmesine bas. Birden fazla method table varsa nesne ve bayt
+değişimlerini inceleyip aramak istediğin tabloyu seç. **Where allocations came from**
+bölümünde aynı süreç çalışmasına ait Call Sites kaydını seçerek oluşturma yerlerini gör.
+**What keeps it alive**
+bölümünde minimum nesne boyutunu gir, **Find objects** ile örnekleri listele ve en fazla
+üç nesneyi seçip **Find GC roots** düğmesine bas. Zincirdeki bir nesneyi seçtiğinde, SOS’un
+doğrulayabildiği doğrudan referans alanları gösterilir.
+
+**Find source in PDB**, assembly’nin derleme kimliğini dump’taki kayıtla doğrulayıp
+eşleşen Portable PDB ile C# kaynak konumunu çözer. Dump başka
+makineden geldiyse **Choose assembly from dump build…** ile aynı derlemenin assembly’sini
+ve gerekirse **Choose local source…** ile yerel kaynak dosyasını seç. Büyük dump’larda
+geçen süre, kullanılan SOS sürümü ilerleme üretiyorsa tarama ilerlemesi ve **Cancel**
+düğmesi gösterilir.
+
+Analiz, yerel `dotnet-dump` kurulumunu kullanır. Araç yüklü değilse
+`dotnet tool install --global dotnet-dump` komutuyla yükle. Dump alırken varsayılan **Full**
+türünü veya `--type Heap` seçeneğini kullan. Windows x64’te alınan bir dump için analizi
+Windows x64 üzerinde çalıştır. Dump farklı bir .NET sürümünde alındıysa tanılama aracı
+o sürümün eşleşen DAC kitaplığına ihtiyaç duyabilir.
+
 ### Derleme
 
 ```bash
@@ -110,9 +149,33 @@ Bir kez hazırla:
 ```bash
 npm run collector:docker                  # makinenin mimarisi (Docker Desktop'ta doğru seçim)
 npm run collector:docker -- linux-x64     # amd64 image'lar için
+npm run collector:docker -- linux-x64 musl      # Alpine (musl) amd64
+npm run collector:docker -- linux-arm64 musl    # Alpine (musl) arm64
 ```
 
-Hangi build'lerin hazır olduğunu `memoryspy --check | jq .docker` söyler. Sonra sol raydaki
+Hangi build'lerin hazır olduğunu `memoryspy --check | jq .docker` söyler. Uygulamadaki
+**Container Support** sekmesi aynı soruyu üç ayrı arızayı ayırarak yanıtlar: Docker CLI'sı var mı
+ve daemon cevap veriyor mu, hangi Linux build'leri yayınlanmış, ve yayınlanan musl build'lerinin
+`libs/` çalışma zamanı yerinde mi. **Re-check** bu bilgileri yeniden okur.
+
+musl build'i `libs/` olmadan yayınlanmışsa (eski bir publish, ya da daemon olmadan yapılmış bir
+musl publish'i) o satırda **Repair** düğmesi çıkar: uygulama `libstdc++.so.6` ve `libgcc_s.so.1`'i
+`runtime-deps:10.0-alpine` image'ından çıkarıp binary'nin yanına kendisi koyar, yani terminale ve
+`npm`'e gerek kalmaz. İndirilen kütüphaneler uygulamanın veri klasöründe önbelleklenir; aynı build
+ikinci kez onarılırsa image yeniden çekilmez. Onarım Docker daemon'ı ister (kütüphaneler bir
+image'dan gelir) ve yalnızca **zaten yayınlanmış** bir musl build için çalışır: hiç yayınlanmamış
+bir varyantın build edilmesi `dotnet` ve depo gerektirdiği için uygulamanın işi değildir, o satır
+komutu söyler.
+
+**Container Support** ayrıca her çalışan konteynerin `/tmp`'sinde kalan staged build'leri ölçer:
+kaç build var, toplam ne kadar yer kaplıyor ve **Prune** kaç bayt kazandıracak. Prune en yeni
+build'i korur (bir sonraki attach'ın yeniden kullanacağı çift: binary ve varsa `libs/` klasörü),
+gerisini siler. Çalışmakta olan oturumlar etkilenmez — Linux, adı silinen dosyaların belleğe
+eşlenmiş sayfalarını süreç bitene kadar yaşatır — ve korunan build eskiyse bir sonraki attach
+güncel olanı kopyalar. Ölçüm konteynerin içinde `du` çalıştırdığı için kabuğu olmayan (distroless)
+image'larda o satır "ölçülemedi" der; diğer konteynerlerin sonucu yine gösterilir.
+
+Sonra sol raydaki
 **Containers** bölümünden bir konteynere bas: ilk açılışta collector (tek dosya, ~80 MB)
 konteynere kopyalanır ve `capabilities` ile gerçekten çalıştığı doğrulanır; ardından içindeki
 .NET süreçleri listelenir. Süreç satırına basmak normal attach'tır — derin yakalama ve kayıt
@@ -127,10 +190,25 @@ Bilinmesi gerekenler:
 - Kopya `/tmp/memoryspy-collector-<rid>-<sürüm>` altında durur ve konteyner yeniden başlayınca
   kaybolur; bir sonraki attach'ta yeniden kopyalanır. Ad, uygulamanın taşıdığı binary'nin
   kimliğini içerdiği için uygulama (ya da `collector:docker` çıktısı) güncellenince eski kopya
-  yeniden kullanılmaz — yoksa uzun ömürlü bir konteyner eski collector'la kalırdı. Salt-okunur
-  kök dosya sistemi olan konteynerlerde kopyalama başarısız olur ve bu açıkça bildirilir.
+  yeniden kullanılmaz — yoksa uzun ömürlü bir konteyner eski collector'la kalırdı. Yeni bir kopya
+  doğrulandıktan sonra collector, bir günden eski binary'leri **ve** onların
+  `memoryspy-collector-libs-<rid>-<sürüm>` çalışma zamanı klasörlerini kendisi temizler; aksi
+  hâlde her rebuild uzun ömürlü bir konteynerde ~2,8 MB kütüphane bırakırdı. O anki oturumun
+  kullandığı çift her zaman korunur. `MEMORYSPY_DOCKER_COLLECTOR` eski bir build'i gösteriyorsa ve
+  o sürüm ikinci argümanı reddediyorsa uygulama tek argümanlı temizliğe geri düşer: eski
+  binary'ler yine silinir, yalnızca o sürümün göremediği runtime klasörleri **Container
+  Support**'taki **Prune** düğmesine kalır. Salt-okunur kök dosya sistemi olan konteynerlerde
+  kopyalama başarısız olur ve bu açıkça bildirilir.
 - Belirleyici olan image'ın mimarisidir, makinenin değil: arm64 makinede amd64 bir image
-  `linux-x64` ister.
+  `linux-x64` ister. libc de image'a aittir: Alpine/musl image'ları `linux-musl-*` varyantını ister.
+  Hangi libc'nin kullanılacağı, herhangi bir collector kopyalanmadan önce image'ın kendi dinamik
+  yükleyicisinden (`/lib/ld-musl-*`) anlaşılır; böylece Alpine hedefine önce 85 MB'lık glibc
+  build'i kopyalanmaz.
+- musl build'i C++ çalışma zamanına bağlıdır: .NET apphost'u ve `libcoreclr.so`
+  `libstdc++.so.6` ile `libgcc_s.so.1` ister, çıplak Alpine image'larında ikisi de yoktur. musl
+  collector bu iki kütüphaneyi `libs/` altında taşır; image'da eksikse konteynere kopyalanır ve
+  collector `LD_LIBRARY_PATH` ile başlatılır. musl publish'i bu yüzden Docker daemon'ı gerektirir
+  (kütüphaneler `runtime-deps:10.0-alpine` image'ından çıkarılır); glibc publish'i gerektirmez.
 - Derin yakalama önce konteynerin `/tmp`'sine yazılır, oturum bitince kayıt klasörüne kopyalanır.
   PDB'ler konteynerde yoksa çağrı yerleri satır yerine metot adıyla görünür. Kopyalama
   başarısız olursa ray bunu söyler ve dosyanın hâlâ konteynerde olduğunu belirtir.

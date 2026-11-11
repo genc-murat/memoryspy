@@ -136,6 +136,8 @@ export function ProcessPicker({
   const attached = attachedProcess;
   const isLive = sessionState === 'running' || sessionState === 'starting';
   const dockerNeedsCollector = docker?.available && docker.stagedRids.length === 0;
+  const dockerNeedsMuslRuntime =
+    docker?.available === true && (docker.collectors ?? []).some((variant) => variant.runtimeMissing);
 
   const isAttached = (process_: DotnetProcessInfo, container?: string) =>
     isLive &&
@@ -357,6 +359,13 @@ export function ProcessPicker({
             <p className="rail-note rail-note-warn">
               No Linux collector has been published, so containers cannot be inspected yet. Run{' '}
               <code className="tag-mono">npm run collector:docker</code>.
+            </p>
+          )}
+
+          {docker.available && dockerNeedsMuslRuntime && (
+            <p className="rail-note rail-note-warn">
+              A published musl collector is missing its <code>libs/</code> runtime, so bare Alpine
+              images cannot be inspected. Details are in the <strong>Container Support</strong> tab.
             </p>
           )}
 

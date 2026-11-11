@@ -22,6 +22,7 @@ import type {
   SessionState,
 } from './lib/types';
 import { useMetrics } from './lib/useMetrics';
+import { useDumpAnalysis } from './lib/useDumpAnalysis';
 import { resolvePanels, resolvePanelsForRecording, type PanelContext } from './panels/registry';
 
 const EMPTY_SETTINGS: Settings = {
@@ -73,6 +74,24 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Whether a cheap listing names exactly the targets the rail is already showing.
+ *
+ * A fast tick skips the collector's OS-level enrichment — a `ps` and an `lsof` per .NET
+ * process, measured at ~70 ms each — which is what carries the command line and runtime
+ * version shown on every row. A tick that finds the target set unchanged is therefore done:
+ * the rows on screen are still accurate, only their memory numbers needed refreshing. A tick
+ * that finds the set changed (a service restarted, something crashed) falls through to one
+ * full listing, so the new rows arrive with their detail instead of losing it until the next
+ * manual rescan. Steady state pays the cheap price; change pays the full one exactly once.
+ */
+function sameTargets(before: DotnetProcessInfo[], after: DotnetProcessInfo[]): boolean {
+  if (before.length !== after.length) return false;
+  const key = (process_: DotnetProcessInfo) => `${process_.pid}@${process_.startTimeUnixMs ?? 0}`;
+  const known = new Set(before.map(key));
+  return after.every((process_) => known.has(key(process_)));
+}
+
 /** The application shell: target selection, view switching, and session lifecycle. */
 export function App() {
   const storeRef = useRef<MetricsStore | null>(null);
@@ -87,6 +106,19 @@ export function App() {
   const [docker, setDocker] = useState<DockerStatus | null>(null);
   const [containers, setContainers] = useState<DockerContainer[]>([]);
   const [containerProcesses, setContainerProcesses] = useState<Record<string, DotnetProcessInfo[]>>({});
+  /**
+   * The listings the rail is showing, mirrored for the background ticks to compare against.
+   * See {@link sameTargets}: the fast refresh decides whether a full one is owed by comparing
+   * the new list with what the user is actually looking at.
+   */
+  const processesRef = useRef<DotnetProcessInfo[]>([]);
+  const containerProcessesRef = useRef<Record<string, DotnetProcessInfo[]>>({});
+  /** The tab strip, which scrolls horizontally when the labels outgrow the window. */
+  const tabsRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    processesRef.current = processes;
+    containerProcessesRef.current = containerProcesses;
+  }, [processes, containerProcesses]);
   /**
    * Containers whose process list is open in the rail.
    *
@@ -139,6 +171,7 @@ export function App() {
   const [deepCaptureEnabled, setDeepCaptureEnabled] = useState(false);
   const [recordingsDir, setRecordingsDir] = useState('');
   const [recordingsToken, setRecordingsToken] = useState(0);
+  const dumpAnalysis = useDumpAnalysis();
 
   // The latest playback status, kept outside React state so the event handler can compare
   // runs synchronously: two statuses can arrive in one batch, and reading `playback` from a
@@ -229,12 +262,26 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const refreshProcesses = useCallback(async (quiet = false) => {
+  /**
+   * Brings the process list up to date.
+   *
+   * `fast` skips the collector's per-process OS enrichment and is what the periodic tick uses:
+   * listing is one child-process spawn of the collector either way, and the enrichment is the
+   * expensive half (measured: 255 ms full against 114 ms fast on a machine with a handful of
+   * .NET processes, ~70 ms of it per process). A fast pass that finds the targets changed
+   * immediately follows with one full pass so no row loses its command line or runtime version.
+   */
+  const refreshProcesses = useCallback(async (quiet = false, fast = false) => {
     if (!quiet) setLoadingProcesses(true);
     try {
-      const list = await api.listProcesses(false);
+      const list = await api.listProcesses(fast);
       setProcesses(list);
       setError(null);
+      if (fast && !sameTargets(processesRef.current, list)) {
+        // The targets moved under the rail; pay for the detail exactly once.
+        const detailed = await api.listProcesses(false);
+        setProcesses(detailed);
+      }
     } catch (listError) {
       setError(messageOf(listError));
     } finally {
@@ -296,7 +343,7 @@ export function App() {
    * is why the row shows a busy state instead of doing this silently in the background.
    */
   const listContainerProcesses = useCallback(
-    async (container: string, quiet = false): Promise<DotnetProcessInfo[] | null> => {
+    async (container: string, quiet = false, fast = false): Promise<DotnetProcessInfo[] | null> => {
       // A listing already in flight for this container wins: a periodic tick must not stack on
       // top of it, and a double click must not become two `docker exec` calls.
       if (containerBusyRef.current.includes(container)) return null;
@@ -305,8 +352,16 @@ export function App() {
       setContainerBusy(containerBusyRef.current);
 
       try {
-        const list = await api.listContainerProcesses(container);
+        const list = await api.listContainerProcesses(container, fast);
         setContainerProcesses((current) => ({ ...current, [container]: list }));
+        if (fast && !sameTargets(containerProcessesRef.current[container] ?? [], list)) {
+          // Same contract as the local tick: the targets changed, so one full pass is owed —
+          // inside a container that is a collector launch plus `ps`/`lsof` per process, which
+          // is exactly what a ten-second tick must not pay every time.
+          const detailed = await api.listContainerProcesses(container, false);
+          setContainerProcesses((current) => ({ ...current, [container]: detailed }));
+          return detailed;
+        }
         return list;
       } catch (inspectError) {
         // A background refresh is silent on purpose: the next tick retries, and a transient
@@ -332,8 +387,8 @@ export function App() {
    * look stuck, and each row reports its own busy state anyway.
    */
   const refreshContainerProcesses = useCallback(
-    async (names: string[], quiet = false) => {
-      await Promise.all(names.map((name) => listContainerProcesses(name, quiet)));
+    async (names: string[], quiet = false, fast = false) => {
+      await Promise.all(names.map((name) => listContainerProcesses(name, quiet, fast)));
     },
     [listContainerProcesses],
   );
@@ -368,6 +423,17 @@ export function App() {
     );
   }, [refreshContainers, refreshContainerProcesses]);
 
+  /**
+   * Re-reads Docker reachability and the collector inventory, without listing containers.
+   *
+   * The container-support view is about the environment, not about what is running: a machine
+   * with Docker stopped or no containers at all still has a useful answer, and it should not pay
+   * for a container listing plus a process pass to get it.
+   */
+  const refreshDockerStatus = useCallback(async () => {
+    setDocker(await api.dockerStatus());
+  }, []);
+
   /** The rail's Rescan: local processes and containers, both brought up to date. */
   const refreshAll = useCallback(async () => {
     await refreshProcesses();
@@ -375,10 +441,13 @@ export function App() {
   }, [refreshProcesses, refreshDocker]);
 
   // Keep the process list fresh while nothing is attached, so a restarted service reappears
-  // without the user having to press Rescan.
+  // without the user having to press Rescan. The tick is deliberately the cheap listing: it runs
+  // every five seconds for as long as the app is open, and the full listing spawns `ps` and
+  // `lsof` per .NET process. A tick that finds the targets changed falls through to one full
+  // pass (see `sameTargets`), so rows never lose their command line and runtime version.
   useEffect(() => {
     if (sessionState === 'running' || sessionState === 'starting') return;
-    const timer = setInterval(() => void refreshProcesses(true), 5000);
+    const timer = setInterval(() => void refreshProcesses(true, true), 5000);
     return () => clearInterval(timer);
   }, [sessionState, refreshProcesses]);
 
@@ -391,7 +460,9 @@ export function App() {
     if (!docker?.available || docker.stagedRids.length === 0) return;
 
     const timer = setInterval(() => {
-      void refreshContainerProcesses(expandedContainersRef.current, true);
+      // The cheap listing, for the same reason as the local tick above; a changed target set
+      // triggers the one full pass that restores the row detail.
+      void refreshContainerProcesses(expandedContainersRef.current, true, true);
     }, CONTAINER_REFRESH_MS);
 
     return () => clearInterval(timer);
@@ -416,6 +487,30 @@ export function App() {
   useEffect(() => {
     activePanelRef.current = activePanel;
     patchViewState({ panel: activePanel });
+  }, [activePanel]);
+
+  // The strip scrolls instead of wrapping, so on a narrow window the selected tab can be the one
+  // past the edge. Revealing it keeps the active underline visible; the other tabs stay one
+  // horizontal scroll away.
+  useEffect(() => {
+    const nav = tabsRef.current;
+    if (!nav) return;
+
+    const reveal = () => {
+      const active = nav.querySelector<HTMLElement>('.tab.is-active');
+      if (!active) return;
+      const navRect = nav.getBoundingClientRect();
+      const activeRect = active.getBoundingClientRect();
+      if (activeRect.left < navRect.left) {
+        nav.scrollLeft -= navRect.left - activeRect.left;
+      } else if (activeRect.right > navRect.right) {
+        nav.scrollLeft += activeRect.right - navRect.right;
+      }
+    };
+
+    reveal();
+    window.addEventListener('resize', reveal);
+    return () => window.removeEventListener('resize', reveal);
   }, [activePanel]);
 
   // The scroll container is one element shared by every tab, so its position is remembered per
@@ -966,7 +1061,9 @@ export function App() {
 
   // ---- Derived ------------------------------------------------------------------------
 
-  const diagnosis = useMemo(() => diagnose(store), [store]);
+  // Recomputed when the store ticks. `store` alone is a stable reference, so memoising on it
+  // froze this at the first render and the header badge never noticed a problem it detected.
+  const diagnosis = useMemo(() => diagnose(store), [store, store.version]);
   const panels = useMemo(
     () =>
       replayRecording
@@ -992,11 +1089,13 @@ export function App() {
     sessionId,
     settings,
     collector,
+    docker,
     capabilities,
     recordingsDir,
     activeRecordingPath: playback?.recording.path ?? null,
     recordingPath: recording?.path ?? null,
     recordingsToken,
+    dumpAnalysis,
     onReplayRecording: (path) => void startReplay(path),
     onOpenTarget: (target) => {
       if (target) setActivePanel(target);
@@ -1005,6 +1104,7 @@ export function App() {
     onTakeSnapshot: () => void takeSnapshot(),
     onSaveSettings: saveSettings,
     onRefreshCollector: refreshCollector,
+    onRefreshDocker: refreshDockerStatus,
   };
 
   const uptime = store.session.stats ? formatDuration(store.session.stats.uptimeMs) : null;
@@ -1155,7 +1255,7 @@ export function App() {
         />
 
         <main className="main">
-          <nav className="tabs" role="tablist">
+          <nav className="tabs" role="tablist" ref={tabsRef}>
             {panels.map(({ definition, available, missing }) => (
               <button
                 type="button"

@@ -143,8 +143,12 @@ export function TimeSeriesChart({
     const dpr = window.devicePixelRatio || 1;
     const { width, height: h } = size;
 
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(h * dpr);
+    // Only touch the backing store when the size really changed: assigning width/height
+    // reallocates and clears the canvas, which would otherwise happen on every redraw.
+    const pixelWidth = Math.floor(width * dpr);
+    const pixelHeight = Math.floor(h * dpr);
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     canvas.style.width = `${width}px`;
     canvas.style.height = `${h}px`;
 

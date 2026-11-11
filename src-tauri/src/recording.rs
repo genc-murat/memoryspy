@@ -291,6 +291,22 @@ pub fn read_summary(path: &Path) -> Result<RecordingSummary, String> {
 // Writer
 // ---------------------------------------------------------------------------------------
 
+/// The NDJSON line that records one collector envelope.
+///
+/// Built by splicing rather than by serialising a value: the envelope is already JSON, so
+/// recording it is string concatenation. The key order here (`kind` first) differs from the
+/// sorted order the old `serde_json::Value` build produced, which carries no meaning in this
+/// format — readers look the fields up by name.
+pub fn recording_message_line(envelope_json: &str) -> String {
+    let mut line = String::with_capacity(envelope_json.len() + 32);
+    line.push_str("{\"kind\":\"");
+    line.push_str(KIND_MESSAGE);
+    line.push_str("\",\"envelope\":");
+    line.push_str(envelope_json);
+    line.push('}');
+    line
+}
+
 /// Appends collector output to a recording file.
 ///
 /// One writer owns one file and is shared by the session's stdout and stderr pumps, so this
@@ -407,8 +423,12 @@ impl RecordingWriter {
     }
 
     /// Records one collector envelope, exactly as it was read from the collector.
-    pub fn record_message(&self, envelope: &Value) {
-        if self.write_line(&json!({ "kind": KIND_MESSAGE, "envelope": envelope })) {
+    ///
+    /// The envelope arrives as the raw JSON text the collector produced and is spliced into
+    /// the recording line as it is: a recording is the evidence, and nothing on its way to
+    /// disk re-parses or re-prints it.
+    pub fn record_message(&self, envelope_json: &str) {
+        if self.write_raw_line(&recording_message_line(envelope_json)) {
             self.messages.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -480,16 +500,23 @@ impl RecordingWriter {
     }
 
     fn write_line(&self, value: &Value) -> bool {
+        self.write_raw_line(&value.to_string())
+    }
+
+    /// Writes one pre-formed JSON line. The message path hands this the collector's own text;
+    /// the header, footer and log lines are still built here as values.
+    fn write_raw_line(&self, line: &str) -> bool {
         if self.broken.load(Ordering::Relaxed) {
             return false;
         }
 
-        let mut line = value.to_string();
-        line.push('\n');
-
         {
             let mut guard = lock(&self.file);
-            if let Err(error) = guard.write_all(line.as_bytes()) {
+            let mut failure = guard.write_all(line.as_bytes()).err();
+            if failure.is_none() {
+                failure = guard.write_all(b"\n").err();
+            }
+            if let Some(error) = failure {
                 // Record the failure once and stop trying: a full disk would otherwise turn
                 // into a write attempt and an error string per message.
                 self.broken.store(true, Ordering::Relaxed);
@@ -498,7 +525,8 @@ impl RecordingWriter {
             }
         }
 
-        self.bytes.fetch_add(line.len() as u64, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
 
         let due = {
             let mut last = lock(&self.last_flush);
@@ -614,7 +642,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// One replayable item from a recording.
 #[derive(Debug, Clone)]
 enum RecordedEvent {
-    Message(Value),
+    /// A collector envelope, kept as the raw JSON text it had in the file.
+    Message { raw: String, ts: u64 },
     Log {
         level: String,
         message: String,
@@ -625,7 +654,7 @@ enum RecordedEvent {
 impl RecordedEvent {
     fn ts(&self) -> u64 {
         match self {
-            RecordedEvent::Message(envelope) => envelope_ts(envelope),
+            RecordedEvent::Message { ts, .. } => *ts,
             RecordedEvent::Log { ts, .. } => *ts,
         }
     }
@@ -633,9 +662,12 @@ impl RecordedEvent {
     /// Replay feeds the frontend the same envelopes a live session would. A recorded stderr
     /// line becomes a `log` envelope rather than a host log, because the store stamps host
     /// logs with the wall clock — which during a replay is not when it happened.
-    fn into_envelope(self) -> Value {
+    ///
+    /// A message is handed on as the text it already is — no parse and reprint on the way to
+    /// the webview, which matters when a four hour recording is replayed at 240x.
+    fn into_envelope(self) -> String {
         match self {
-            RecordedEvent::Message(envelope) => envelope,
+            RecordedEvent::Message { raw, .. } => raw,
             RecordedEvent::Log { level, message, ts } => json!({
                 "v": 1,
                 "seq": 0,
@@ -643,7 +675,8 @@ impl RecordedEvent {
                 "type": "log",
                 "probe": null,
                 "data": { "level": level, "message": message },
-            }),
+            })
+            .to_string(),
         }
     }
 }
@@ -720,11 +753,11 @@ impl RecordingReader {
         self.last_event_ts
     }
 
-    fn count_message(&mut self, envelope: &Value) {
+    fn count_message(&mut self, ts: u64, message_type: Option<&str>) {
         self.message_count += 1;
-        self.note_event(envelope_ts(envelope));
+        self.note_event(ts);
 
-        if let Some(message_type) = envelope.get("type").and_then(Value::as_str) {
+        if let Some(message_type) = message_type {
             *self
                 .message_types
                 .entry(message_type.to_string())
@@ -747,6 +780,40 @@ impl RecordingReader {
         self.parse_next()
     }
 
+    /// The shape that dominates a recording: a `message` wrapper around one envelope.
+    ///
+    /// Returns the envelope as the raw text it already is, plus the fields the replay clock
+    /// and the summary take from it. Everything else — a header, a footer, a stderr log, an
+    /// unwrapped envelope from another tool, junk — returns `None` and goes through the
+    /// tolerant path below, which is slower but never refuses a line this shape does not
+    /// cover.
+    fn message_line(line: &str) -> Option<(String, u64, Option<String>)> {
+        #[derive(Deserialize)]
+        struct MessageLine<'a> {
+            #[serde(borrow)]
+            kind: &'a str,
+            #[serde(borrow)]
+            envelope: &'a serde_json::value::RawValue,
+        }
+
+        #[derive(Deserialize)]
+        struct EnvelopeFields {
+            #[serde(default)]
+            ts: Option<u64>,
+            #[serde(default, rename = "type")]
+            kind: Option<String>,
+        }
+
+        let parsed = serde_json::from_str::<MessageLine<'_>>(line).ok()?;
+        if parsed.kind != KIND_MESSAGE {
+            return None;
+        }
+
+        let raw = parsed.envelope.get();
+        let fields = serde_json::from_str::<EnvelopeFields>(raw).ok()?;
+        Some((raw.to_string(), fields.ts.unwrap_or(0), fields.kind))
+    }
+
     fn parse_next(&mut self) -> Option<RecordedEvent> {
         while !self.done {
             let line = match self.lines.next() {
@@ -764,6 +831,13 @@ impl RecordingReader {
                 continue;
             }
             self.line_count += 1;
+
+            // Fast path first: a recorded envelope is the overwhelming majority of a
+            // recording, and it is replayed as the text it already is.
+            if let Some((raw, ts, message_type)) = Self::message_line(line) {
+                self.count_message(ts, message_type.as_deref());
+                return Some(RecordedEvent::Message { raw, ts });
+            }
 
             let value: Value = match serde_json::from_str(line) {
                 Ok(value) => value,
@@ -817,15 +891,24 @@ impl RecordingReader {
                         self.skipped += 1;
                         continue;
                     };
-                    let envelope = envelope.clone();
-                    self.count_message(&envelope);
-                    return Some(RecordedEvent::Message(envelope));
+                    // The odd message line the fast shape did not cover: still replayed,
+                    // just with the envelope re-printed from its parsed form.
+                    let ts = envelope_ts(envelope);
+                    self.count_message(ts, envelope.get("type").and_then(Value::as_str));
+                    return Some(RecordedEvent::Message {
+                        raw: envelope.to_string(),
+                        ts,
+                    });
                 }
                 _ => {
                     // An unwrapped envelope: the shape any other capture tool would produce.
                     if value.get("ts").is_some() && value.get("type").is_some() {
-                        self.count_message(&value);
-                        return Some(RecordedEvent::Message(value));
+                        let ts = envelope_ts(&value);
+                        self.count_message(ts, value.get("type").and_then(Value::as_str));
+                        return Some(RecordedEvent::Message {
+                            raw: value.to_string(),
+                            ts,
+                        });
                     }
                     self.skipped += 1;
                 }
@@ -1249,7 +1332,7 @@ fn run_playback(inner: Arc<PlaybackInner>, receiver: Receiver<PlaybackCommand>) 
         let mut fast_forward_until = pending_seek
             .take()
             .map(|position| base_ts.saturating_add(position));
-        let mut batch: Vec<Value> = Vec::new();
+        let mut batch: Vec<String> = Vec::new();
         let mut last_batch_flush = Instant::now();
 
         inner.update(|runtime| {
@@ -1378,7 +1461,7 @@ fn run_playback(inner: Arc<PlaybackInner>, receiver: Receiver<PlaybackCommand>) 
     }
 }
 
-fn flush_batch(inner: &PlaybackInner, batch: &mut Vec<Value>) {
+fn flush_batch(inner: &PlaybackInner, batch: &mut Vec<String>) {
     if batch.is_empty() {
         return;
     }

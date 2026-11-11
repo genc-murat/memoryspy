@@ -743,8 +743,8 @@ code {
 }
 
 .tab {
-  /* 9px, not 12: at a 1280-wide window the nine tabs then fit without the strip having to
-     scroll, so the last one is not the one that loses. Narrower windows still scroll. */
+  /* 9px, not 12: the ten tabs fit at the default window width. Narrower windows scroll, and
+     the shell keeps the selected tab in view so the active underline never sits past the edge. */
   padding: 8px 9px;
   background: transparent;
   border: none;
@@ -1134,6 +1134,22 @@ code {
 
 .notice span {
   color: var(--text-dim);
+}
+
+/* A warning's controls: one button per broken variant, so a repair names what it fixes. */
+.repair-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+/* A CLI's own error text, kept verbatim but allowed to wrap: Docker's messages are long. */
+.notice-detail {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
 }
 
 .notice-button {
@@ -2227,6 +2243,278 @@ code {
   min-width: 0;
   font-family: var(--font-mono);
   font-size: 11.5px;
+}
+
+.dump-import-row {
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.dump-import-row .input {
+  flex-basis: 220px;
+}
+
+.dump-file-name {
+  overflow-wrap: anywhere;
+}
+
+.dump-error {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.dump-operation-error {
+  position: sticky;
+  top: -18px;
+  z-index: 3;
+}
+
+.dump-table-head {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.dump-table th {
+  top: 0;
+}
+
+.dump-table .share-col {
+  white-space: nowrap;
+}
+
+.dump-baseline {
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.dump-baseline p,
+.dump-roots p {
+  margin: 4px 0 0;
+}
+
+.dump-baseline strong,
+.dump-roots h3 {
+  overflow-wrap: anywhere;
+}
+
+.dump-growth-filter {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.dump-table .dump-growth {
+  color: var(--amber);
+}
+
+.dump-root-button {
+  white-space: nowrap;
+}
+
+.dump-roots {
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--ink-850);
+  scroll-margin: 12px;
+}
+
+.dump-roots h3 {
+  margin: 0;
+}
+
+.dump-roots pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 8px;
+  background: var(--ink-900);
+  font: 11px/1.6 var(--font-mono);
+}
+
+.dump-progress {
+  position: sticky;
+  top: -18px;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.dump-progress p {
+  margin: 4px 0 0;
+}
+
+.dump-progress progress {
+  display: block;
+  margin-top: 6px;
+  width: min(100%, 320px);
+  height: 6px;
+  accent-color: var(--amber);
+}
+
+.dump-timeline ol,
+.dump-history-values,
+.dump-allocation-sites,
+.dump-reference-chain {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+.dump-timeline ol,
+.dump-history-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dump-timeline button,
+.dump-history-values li {
+  display: grid;
+  justify-items: start;
+  gap: 3px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.dump-history-values li {
+  padding: 5px 8px;
+  border: 1px solid var(--line-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.dump-timeline button[aria-pressed="true"],
+.dump-reference-chain button[aria-pressed="true"] {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.dump-inspection {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dump-inspection h2,
+.dump-allocation-sites code,
+.dump-owner strong {
+  overflow-wrap: anywhere;
+}
+
+.dump-inspection-part {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 10px;
+}
+
+.dump-sample-controls {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  margin-top: 8px;
+}
+
+.dump-sample-controls input {
+  width: 100%;
+}
+
+.dump-object-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 4px 8px;
+  margin: 6px 0 10px;
+}
+
+.dump-object-list label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border: 1px solid var(--line-soft);
+}
+
+.dump-allocation-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 12px;
+}
+
+.dump-trace-picker {
+  margin-top: 8px;
+  max-width: 480px;
+}
+
+.dump-allocation-sites li {
+  padding: 6px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.dump-root-evidence {
+  margin-top: 10px;
+}
+
+.dump-growth {
+  color: var(--amber);
+}
+
+.dump-owner {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  margin: 8px 0;
+  padding: 8px;
+  border-left: 2px solid var(--amber);
+  background: var(--ink-900);
+}
+
+.dump-reference-chain {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+
+.dump-reference-chain button {
+  display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.dump-symbols,
+.dump-source-code {
+  width: 100%;
+  min-width: 0;
+}
+
+.dump-symbols .table-controls,
+.dump-source-code .table-controls,
+.dump-table-head .table-controls {
+  flex-wrap: wrap;
+}
+
+.dump-source-line {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+}
+
+.dump-source-highlight {
+  background: rgba(242, 169, 59, 0.12);
+  color: var(--amber);
+}
+
+.dump-pagination {
+  justify-content: flex-end;
+  margin-top: 8px;
 }
 
 .recording-summary {

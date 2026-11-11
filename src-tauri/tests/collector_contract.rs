@@ -49,8 +49,12 @@ struct RecordingSink {
 }
 
 impl EventSink for RecordingSink {
-    fn messages(&self, _session_id: &str, messages: Vec<Value>) {
-        self.messages.lock().unwrap().extend(messages);
+    fn messages(&self, _session_id: &str, messages: Vec<String>) {
+        // The pipeline hands on raw JSON lines; the assertions below work on values.
+        let parsed = messages.iter().map(|message| {
+            serde_json::from_str(message).expect("the pipeline forwards valid JSON")
+        });
+        self.messages.lock().unwrap().extend(parsed);
     }
 
     fn log(&self, _session_id: &str, level: &str, message: &str) {

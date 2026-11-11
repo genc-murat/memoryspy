@@ -9,7 +9,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 use std::sync::Arc;
 
@@ -17,7 +18,9 @@ use crate::collector::{
     self, CollectorLocation, DotnetProcessInfo, EventSink, SessionHandle, SessionRequest,
     SessionState,
 };
-use crate::docker::{self, DockerContainer, DockerStatus};
+use crate::docker::{self, CollectorVariant, ContainerStaging, DockerContainer, DockerStatus};
+use crate::dump::{DumpAnalysis, DumpAnalyzer, DumpObject, DumpReference, DumpRoots};
+use crate::dump_source::{self, DumpSourceLocation, SourcePreview};
 use crate::recording::{self, PlaybackHandle, RecordingSummary};
 use crate::settings::{self, Settings};
 
@@ -28,6 +31,7 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, SessionHandle>>,
     starting_sessions: Mutex<HashSet<SessionTarget>>,
     pub playbacks: Mutex<HashMap<String, PlaybackHandle>>,
+    pub dump_analyzer: DumpAnalyzer,
     pub settings: Mutex<Settings>,
     pub sink: Arc<dyn EventSink>,
 }
@@ -89,6 +93,7 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             starting_sessions: Mutex::new(HashSet::new()),
             playbacks: Mutex::new(HashMap::new()),
+            dump_analyzer: DumpAnalyzer::default(),
             settings: Mutex::new(settings),
             sink,
         }
@@ -233,6 +238,26 @@ pub async fn get_docker_status() -> Result<DockerStatus, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Bundles a published musl collector's C++ runtime so bare Alpine images can run it.
+///
+/// The repair needs a place to keep the extracted libraries: they are cached under the app's data
+/// directory, so a resources directory that is rebuilt (or read-only) does not force the runtime
+/// image to be pulled again.
+#[tauri::command]
+pub async fn repair_collector_variant(
+    app: AppHandle,
+    rid: String,
+) -> Result<CollectorVariant, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve the app data directory: {e}"))?;
+
+    tauri::async_runtime::spawn_blocking(move || docker::repair_variant(&rid, &root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Running containers, which are the only targets the Docker transport can attach to.
 #[tauri::command]
 pub async fn list_docker_containers() -> Result<Vec<DockerContainer>, String> {
@@ -241,15 +266,44 @@ pub async fn list_docker_containers() -> Result<Vec<DockerContainer>, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Disk used by collector builds staged inside every running container.
+///
+/// A separate command from [`get_docker_status`] on purpose: measuring means one `docker exec`
+/// per container, while the status probe is called at startup and must stay cheap. The
+/// container-support view asks for this when it is opened.
+#[tauri::command]
+pub async fn get_docker_staging() -> Result<Vec<ContainerStaging>, String> {
+    tauri::async_runtime::spawn_blocking(docker::staging_usage)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Removes every staged collector build in `container` except the newest.
+///
+/// Kept separate from the automatic cleanup because the user may want the space back now: the
+/// collector only prunes after a rebuild, and only copies older than a day.
+#[tauri::command]
+pub async fn prune_docker_staging(container: String) -> Result<ContainerStaging, String> {
+    tauri::async_runtime::spawn_blocking(move || docker::prune_staging(&container))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The attachable .NET processes inside one container.
 ///
 /// This stages the Linux collector into the container on first use, which is why it is a
 /// command of its own rather than part of the process list the rail refreshes every few seconds.
+/// `fast` skips the OS-level enrichment inside the container; see [`docker::list_processes`].
 #[tauri::command]
-pub async fn list_container_processes(container: String) -> Result<Vec<DotnetProcessInfo>, String> {
-    tauri::async_runtime::spawn_blocking(move || docker::list_processes(&container))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn list_container_processes(
+    container: String,
+    fast: Option<bool>,
+) -> Result<Vec<DotnetProcessInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        docker::list_processes(&container, fast.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -450,6 +504,106 @@ pub async fn reveal_in_folder(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || crate::reveal::reveal(&path))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn pick_dump(window: tauri::WebviewWindow, kind: Option<String>) -> Result<Option<String>, String> {
+    let dialog = window.dialog().file().set_parent(&window);
+    let dialog = match kind.as_deref() {
+        Some("assembly") => dialog.set_title("Open the assembly from the dump build")
+            .add_filter(".NET assemblies", &["dll", "exe"]),
+        Some("source") => dialog.set_title("Choose the local source file")
+            .add_filter("Source files", &["cs", "fs", "vb"]),
+        _ => dialog.set_title("Open a .NET memory dump")
+            .add_filter("Memory dumps", &["dmp", "dump", "core"])
+            .add_filter("All files", &["*"]),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        dialog
+            .blocking_pick_file()
+            .map(|file| file.into_path().map_err(|error| error.to_string()))
+            .transpose()?
+            .map(|path| {
+                path.into_os_string()
+                    .into_string()
+                    .map_err(|_| "This file path cannot be represented as text.".to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn analyze_dump(
+    state: State<'_, AppState>,
+    path: String,
+    progress: tauri::ipc::Channel<String>,
+) -> Result<Option<DumpAnalysis>, String> {
+    state.dump_analyzer.analyze(Path::new(&path), &progress).await
+}
+
+#[tauri::command]
+pub async fn sample_dump_objects(
+    state: State<'_, AppState>,
+    path: String,
+    dump_id: String,
+    method_table: String,
+    min_bytes: u64,
+    progress: tauri::ipc::Channel<String>,
+) -> Result<Option<Vec<DumpObject>>, String> {
+    state.dump_analyzer.objects(Path::new(&path), &dump_id, &method_table, min_bytes, &progress).await
+}
+
+#[tauri::command]
+pub async fn inspect_dump_roots(
+    state: State<'_, AppState>,
+    path: String,
+    dump_id: String,
+    addresses: Vec<String>,
+    progress: tauri::ipc::Channel<String>,
+) -> Result<Option<DumpRoots>, String> {
+    state.dump_analyzer.roots(Path::new(&path), &dump_id, &addresses, &progress).await
+}
+
+#[tauri::command]
+pub async fn inspect_dump_reference(
+    state: State<'_, AppState>,
+    path: String,
+    dump_id: String,
+    parent: String,
+    child: Option<String>,
+) -> Result<Option<DumpReference>, String> {
+    state.dump_analyzer.reference(Path::new(&path), &dump_id, &parent, child.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn resolve_dump_source(
+    state: State<'_, AppState>,
+    path: String,
+    dump_id: String,
+    assembly: String,
+    method_table: String,
+    type_name: String,
+    method_name: Option<String>,
+) -> Result<DumpSourceLocation, String> {
+    let identity = crate::dump::module_identity(Path::new(&path), &dump_id, &method_table).await?;
+    dump_source::resolve(&state.location_snapshot(), Path::new(&assembly), &identity, &type_name, method_name.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn preview_dump_source(
+    path: String,
+    line: u32,
+    sha256: Option<String>,
+) -> Result<SourcePreview, String> {
+    tauri::async_runtime::spawn_blocking(move || dump_source::preview(Path::new(&path), line, sha256.as_deref()))
+        .await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn cancel_dump_analysis(state: State<'_, AppState>) {
+    state.dump_analyzer.cancel();
 }
 
 #[tauri::command]

@@ -86,8 +86,12 @@ struct CapturingSink {
 }
 
 impl EventSink for CapturingSink {
-    fn messages(&self, _session_id: &str, messages: Vec<Value>) {
-        self.messages.lock().unwrap().extend(messages);
+    fn messages(&self, _session_id: &str, messages: Vec<String>) {
+        // The pipeline hands on raw JSON lines; the assertions below work on values.
+        let parsed = messages.iter().map(|message| {
+            serde_json::from_str(message).expect("the pipeline forwards valid JSON")
+        });
+        self.messages.lock().unwrap().extend(parsed);
     }
 
     fn log(&self, _session_id: &str, _level: &str, message: &str) {
@@ -210,14 +214,20 @@ fn a_recording_round_trips_through_disk() {
     .expect("the recording must be created");
 
     let base = now_ms();
-    writer.record_message(&json!({
-        "v": 1, "seq": 1, "ts": base, "type": "counter.sample",
-        "data": { "counters": [{ "name": "gc-heap-size", "value": 1 }] },
-    }));
-    writer.record_message(&json!({
-        "v": 1, "seq": 2, "ts": base + 500, "type": "counter.sample",
-        "data": { "counters": [{ "name": "gc-heap-size", "value": 2 }] },
-    }));
+    writer.record_message(
+        &json!({
+            "v": 1, "seq": 1, "ts": base, "type": "counter.sample",
+            "data": { "counters": [{ "name": "gc-heap-size", "value": 1 }] },
+        })
+        .to_string(),
+    );
+    writer.record_message(
+        &json!({
+            "v": 1, "seq": 2, "ts": base + 500, "type": "counter.sample",
+            "data": { "counters": [{ "name": "gc-heap-size", "value": 2 }] },
+        })
+        .to_string(),
+    );
     writer.record_log("debug", "collector said something");
     writer.finish("detached", json!({ "messages": 2 }));
 
@@ -423,13 +433,16 @@ fn pause_seek_and_speed_control_a_replay() {
     // without racing the end of the recording.
     let base = now_ms();
     for index in 0..40u64 {
-        writer.record_message(&json!({
-            "v": 1,
-            "seq": index,
-            "ts": base + index * 400,
-            "type": "counter.sample",
-            "data": { "counters": [], "sampleIndex": index },
-        }));
+        writer.record_message(
+            &json!({
+                "v": 1,
+                "seq": index,
+                "ts": base + index * 400,
+                "type": "counter.sample",
+                "data": { "counters": [], "sampleIndex": index },
+            })
+            .to_string(),
+        );
     }
     writer.finish("detached", json!({}));
 

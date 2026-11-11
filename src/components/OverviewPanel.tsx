@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
 import { diagnose } from '../lib/analysis';
 import { formatBytes, formatBytesCompact, formatBytesPerSecond, formatDuration, formatPercent } from '../lib/format';
@@ -46,7 +46,9 @@ function MetricTile({
  */
 export function OverviewPanel({ store, showAllCounters, replaying = false, onOpenFinding }: Props) {
   const [selected, setSelected] = useState<string | null>(null);
-  const diagnosis = diagnose(store);
+  // `store` is a stable reference; `store.version` is what says the buffers changed, so it is
+  // what the memo has to depend on (see TypesPanel for the same trap).
+  const diagnosis = useMemo(() => diagnose(store), [store, store.version]);
 
   const workingSet = store.counter('working-set');
   const gcHeap = store.counter('gc-heap-size');

@@ -75,6 +75,7 @@ jobs:
         run: |
           npm run typecheck
           npm run build
+          npm run test:dump-report
 
       - name: Build the collector and the sample
         run: npm run prepare:all

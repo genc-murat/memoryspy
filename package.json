@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "test:dump-report": "node --experimental-strip-types --test tests/dump-report.test.mjs",
     "collector:build": "dotnet build collector -c Debug",
     "collector:release": "dotnet build collector -c Release",
     "collector:publish": "node scripts/publish-collector.mjs",

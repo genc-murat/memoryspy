@@ -79,17 +79,24 @@ kendisi değil, onu yaşatan `Task.Delay(...).ContinueWith(...)` örüntüsüdü
 dotnet-dump collect -p 37880 --output C:\dumps\common1.dmp
 ```
 
-MemorySpy’da **Dump Analysis** sekmesini aç. **Browse…** ile dosyayı seç veya dosya yolunu
-yapıştır, ardından **Analyze** düğmesine bas. Sekme yönetilen heap’teki nesne sayısını ve
+MemorySpy’da **Dump Analysis** sekmesini aç. **Browse dumps…** ile dosyayı seç veya dosya yolunu
+yapıştır, ardından **Analyze dump** düğmesine bas. Sekme yönetilen heap’teki nesne sayısını ve
 kaplanan belleği tür bazında gösterir. Sonuçları filtreleyebilir ve bayta veya nesne sayısına
 göre sıralayabilirsin. Heap’teki boş bloklar ayrı gösterilir.
+
+**Browse dumps…** ile birden fazla dosya seçebilirsin. **Analysis queue** bölümünde dosyaları
+**Earlier / Later** ile sıralayıp analizi başlat. Dosyalar aynı heap kapsamıyla tek tek analiz edilir.
+Bir dosya hata verirse kalanlar devam eder. **Retry failed files** yalnızca başarısız dosyaları
+tekrar dener. **Cancel** çalışan analizi ve kuyruğun devamını durdurur. **Continue queue**
+ile iptal edilen dosyadan devam edebilirsin.
 
 **Heap scope** alanındaki **Reachable objects only** seçeneği, SOS’un GC köklerinden erişebildiği
 nesneleri sayar. Bu tarama büyük heap’lerde daha fazla zaman ve RAM kullanabilir. Aynı dosyanın
 iki kapsamda alınmış özetleri birlikte açılabilir. Büyüme karşılaştırmaları aynı kapsamı kullanır.
 
 Sızıntıyı araştırırken aynı süreçten benzer yük altında ayrı dump’lar al. Dosyaları alınma
-sırasıyla aç ve ilkini **Use as baseline** ile seç. **Type growth since baseline** tablosu
+sırasıyla aç ve ilkini **Use as baseline** ile seç. **Captures** altındaki **Edit order** ile aynı
+heap kapsamındaki sonuçların karşılaştırma sırasını değiştirebilirsin. **Type growth since baseline** tablosu
 nesne sayısı ve bayt değişimini gösterir. Üç veya daha fazla dump ile her aralıkta büyüyen
 türleri filtreleyebilirsin. Aynı tür adına ait kayıtlar karşılaştırmada birleştirilir.
 Aynı dosya yoluna yeni bir dump yazarsan yeniden analiz et. Önceki özet ve baseline
@@ -98,10 +105,26 @@ karşılaştırmada kalır. Nesne incelemesi için analiz edilen dosyanın sür�
 Şüpheli türde **Inspect** düğmesine bas. Birden fazla method table varsa nesne ve bayt
 değişimlerini inceleyip aramak istediğin tabloyu seç. **Where allocations came from**
 bölümünde aynı süreç çalışmasına ait Call Sites kaydını seçerek oluşturma yerlerini gör.
-**What keeps it alive**
-bölümünde minimum nesne boyutunu gir, **Find objects** ile örnekleri listele ve en fazla
+**Retaining references** sekmesinde **Find objects** ile örnekleri listele ve en fazla
 üç nesneyi seçip **Find GC roots** düğmesine bas. Zincirdeki bir nesneyi seçtiğinde, SOS’un
 doğrulayabildiği doğrudan referans alanları gösterilir.
+Boyut sınırını **Object size filter**, stack kökü seçimini **Search options** altında değiştirebilirsin.
+**Allocation sites** oluşturma yerlerini, **Growth history** ise dump’lar arasındaki büyümeyi gösterir.
+
+**Report** sekmesi, seçili türün büyüme geçmişini, örnek nesnelerin GC kök zincirlerini,
+bulunmuş referans alanlarını, PDB kaynak konumlarını ve bağlı allocation kaydını raporlar.
+**Investigator notes** alanına beklenen nesne ömrünü ve kodda kontrol edeceğin noktaları yaz.
+**Copy Markdown** ile raporu kopyala veya **Save Markdown…** ile `.md` olarak kaydet.
+Önizleme seçimlerinle birlikte güncellenir; tam dosya yolları ve ham SOS çıktısı isteğe bağlıdır.
+Rapor, o ana kadar toplanmış kanıtları kullanır. Kaynak konumları kodu bulmaya yardımcı olur;
+tek başına hatalı satırı veya sızıntıyı kanıtlamaz.
+
+**Retention evidence** kartı, karşılaştırılan türün bayt büyümesini, aynı tutucuya çıkan örneklerin
+sayısını, seçilen nesnenin referans alanını ve PDB kaynak bağlantısını bir arada gösterir.
+Zincirdeki uzun framework bölümleri açılabilir gruplarda görünür. GC kökü, uygulama tutucusu,
+static alanlar ve hedef nesne zincirde görünür kalır.
+Uygulama açıkken dump’lar ve paneller arasında geçiş yaptığında filtreler, tablo konumu,
+seçili tür, kök sonuçları ve bulunan kaynak konumu korunur.
 
 Her nesnenin sonucu ayrı görünür. Bir arama başarısız olursa diğer nesnelerin zincirleri
 incelenebilir. Zincir, SOS’un bildirdiği kök türünü (thread stack, GC handle veya finalizer queue)

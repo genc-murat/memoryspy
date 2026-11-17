@@ -1,16 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { fileNameOf, formatBytes } from '../lib/format';
+import type { DumpTypeChange } from '../lib/dumpComparison';
+import { allocationTraceKey, groupDumpChain } from '../lib/dumpEvidence';
+import { DumpReport } from './DumpReport';
 import { dumpApi } from '../lib/ipc';
 import type { AllocationSiteData, DumpAnalysis, DumpMethodTable, DumpReference, DumpRootPath, DumpSourceLocation, SourcePreview } from '../lib/types';
 import type { useDumpAnalysis } from '../lib/useDumpAnalysis';
 
 type Analysis = ReturnType<typeof useDumpAnalysis>;
 
-export function DumpInspection({ analysis, traces, reports }: {
+export function DumpInspection({ analysis, traces, reports, onClose, change, baseline }: {
   analysis: Analysis;
   traces: AllocationSiteData[];
   reports: DumpAnalysis[];
+  onClose: () => void;
+  change: DumpTypeChange | null;
+  baseline: DumpAnalysis | null;
 }) {
   const { inspection } = analysis;
   if (!inspection) return null;
@@ -18,99 +24,179 @@ export function DumpInspection({ analysis, traces, reports }: {
     <Inspection
       key={`${inspection.typeName}|${inspection.methodTables.map((table) => table.methodTable).join(',')}`}
       analysis={analysis}
-      inspection={inspection}
+      inspection={{ ...inspection, methodTables: change?.methodTables ?? inspection.methodTables }}
       traces={traces}
       reports={reports}
+      onClose={onClose}
+      change={change}
+      baseline={baseline}
     />
   );
 }
 
-function Inspection({ analysis, inspection, traces, reports }: {
+function Inspection({ analysis, inspection, traces, reports, onClose, change, baseline }: {
   analysis: Analysis;
   inspection: NonNullable<Analysis['inspection']>;
   traces: AllocationSiteData[];
   reports: DumpAnalysis[];
+  onClose: () => void;
+  change: DumpTypeChange | null;
+  baseline: DumpAnalysis | null;
 }) {
   const details = useRef<HTMLElement>(null);
-  const [minKiB, setMinKiB] = useState('0');
-  const [selected, setSelected] = useState<string[]>([]);
-  const [skipStacks, setSkipStacks] = useState(false);
+  const { minKiB, selected, skipStacks, tab } = inspection;
+  const setMinKiB = (minKiB: string) => analysis.updateInspection({ minKiB });
+  const setSelected = (selected: string[]) => analysis.updateInspection({ selected });
+  const setTab = (tab: string) => analysis.updateInspection({ tab });
   const busy = analysis.phase !== 'idle';
   const minBytes = Number(minKiB) * 1024;
   const validMinimum = minKiB.trim() !== '' && Number.isInteger(Number(minKiB)) &&
     Number.isSafeInteger(minBytes) && minBytes >= 0;
-  useEffect(() => details.current?.focus(), []);
+  useEffect(() => {
+    details.current?.focus({ preventScroll: true });
+    details.current?.scrollIntoView({ block: 'nearest' });
+  }, []);
 
   const sampled = inspection.objects;
   const roots = inspection.roots;
   const candidates = sampled?.filter((object) => selected.includes(object.address)) ?? [];
+  const totals = inspection.methodTables.reduce((total, table) => ({
+    objects: total.objects + table.objectCount,
+    bytes: total.bytes + table.totalBytes,
+  }), { objects: 0, bytes: 0 });
+  const tabs = [
+    { id: 'retention', label: 'Retaining references' },
+    { id: 'allocations', label: 'Allocation sites' },
+    ...(reports.length > 1 ? [{ id: 'history', label: 'Growth history' }] : []),
+    { id: 'report', label: 'Report' },
+  ];
+
+  async function findSamples(minimum: number) {
+    await analysis.findObjects(minimum);
+  }
 
   return (
     <section className="dump-roots dump-inspection" ref={details} tabIndex={-1} aria-labelledby="dump-inspection-title">
-      <div className="block-head">
+      <div className="block-head dump-inspection-head">
         <div>
           <span className="field-label">Inspect type</span>
-          <h2 id="dump-inspection-title"><code>{inspection.typeName}</code></h2>
+          <h2 id="dump-inspection-title" tabIndex={-1}><code>{inspection.typeName}</code></h2>
+          <p>{totals.objects.toLocaleString()} objects · {formatBytes(totals.bytes)}</p>
         </div>
+        <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={onClose}>Close inspection</button>
       </div>
-      {reports.length > 1 && <TypeHistory reports={reports} typeName={inspection.typeName} />}
-      <AllocationEvidence traces={traces} typeName={inspection.typeName}
-        selectedTrace={analysis.allocationTrace} linkTrace={analysis.linkAllocationTrace} />
-      <div className="dump-inspection-part">
-        <h3>What keeps it alive</h3>
-        {inspection.methodTables.length > 1 && (
-          <MethodTables tables={inspection.methodTables} selected={inspection.methodTable} disabled={busy}
-            onSelect={(methodTable) => {
-              setSelected([]);
-              analysis.selectMethodTable(methodTable);
-            }} />
-        )}
-        <form className="table-controls dump-sample-controls" onSubmit={(event) => {
-          event.preventDefault();
-          if (!validMinimum || !inspection.methodTable) return;
-          setSelected([]);
-          void analysis.findObjects(minBytes);
-        }}>
-          <label className="field">
-            <span className="field-label">Minimum object size (KiB)</span>
-            <input className="input input-sm" type="number" min={0} step={1} value={minKiB}
-              disabled={busy} onChange={(event) => setMinKiB(event.target.value)} />
-          </label>
-          <button type="submit" className="btn btn-sm" disabled={busy || !validMinimum || !inspection.methodTable}>Find objects</button>
-        </form>
-        {sampled?.length === 0 && <p className="dim">No objects meet the size filter.</p>}
-        {sampled && sampled.length > 0 && (
-          <>
-            <p className="caveat">Select up to three of the {sampled.length} listed objects.</p>
-            <div className="dump-object-list">
-              {sampled.map((object) => (
-                <label key={object.address}>
-                  <input type="checkbox" checked={selected.includes(object.address)}
-                    disabled={busy || (selected.length >= 3 && !selected.includes(object.address))}
-                    onChange={(event) => {
-                      const checked = event.target.checked;
-                      setSelected((current) => checked
-                        ? [...current, object.address]
-                        : current.filter((address) => address !== object.address));
-                    }} />
-                  <code>{object.address}</code>
-                  <span>{formatBytes(object.sizeBytes)}</span>
-                </label>
-              ))}
-            </div>
-            <div className="table-controls dump-root-actions">
-              <button className="btn btn-primary btn-sm" type="button" disabled={busy || !candidates.length}
-                onClick={() => void analysis.inspectRoots(candidates.map((object) => object.address), skipStacks)}>
-                Find GC roots{candidates.length ? ` (${candidates.length})` : ''}
-              </button>
-              <label className="dump-growth-filter">
-                <input type="checkbox" checked={skipStacks} disabled={busy} onChange={(event) => setSkipStacks(event.target.checked)} />
-                Skip stack roots
+      <div className="dump-inspection-tabs" role="tablist" aria-label="Type investigation" onKeyDown={(event) => {
+        const index = tabs.findIndex((item) => item.id === tab);
+        let next = index;
+        if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+        else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        setTab(tabs[next].id);
+        document.getElementById(`dump-tab-${tabs[next].id}`)?.focus();
+      }}>
+        {tabs.map((item) => <button key={item.id} type="button" role="tab" id={`dump-tab-${item.id}`}
+          aria-selected={tab === item.id} aria-controls={`dump-tabpanel-${item.id}`} tabIndex={tab === item.id ? 0 : -1}
+          onClick={() => setTab(item.id)}>{item.label}</button>)}
+      </div>
+      <div role="tabpanel" id="dump-tabpanel-history" aria-labelledby="dump-tab-history" hidden={tab !== 'history'}>
+        {reports.length > 1 && <TypeHistory reports={reports} typeName={inspection.typeName} />}
+      </div>
+      <div role="tabpanel" id="dump-tabpanel-allocations" aria-labelledby="dump-tab-allocations" hidden={tab !== 'allocations'}>
+        <AllocationEvidence traces={traces} typeName={inspection.typeName}
+          selectedTrace={analysis.allocationTrace} linkTrace={analysis.linkAllocationTrace} />
+      </div>
+      <div role="tabpanel" id="dump-tabpanel-report" aria-labelledby="dump-tab-report" hidden={tab !== 'report'}>
+        {analysis.result && <DumpReport analysis={analysis} report={analysis.result} inspection={inspection}
+          reports={reports} baseline={baseline}
+          trace={traces.find((trace) => allocationTraceKey(trace) === analysis.allocationTrace) ?? null} />}
+      </div>
+      <div className="dump-retention-panel" role="tabpanel" id="dump-tabpanel-retention" aria-labelledby="dump-tab-retention"
+        hidden={tab !== 'retention'}>
+        <details className="dump-samples" open={!roots}>
+          <summary>{sampled?.length ? `${candidates.length} of ${sampled.length} samples selected` : 'Choose objects to trace'}</summary>
+          {inspection.methodTables.length > 1 && (
+            <MethodTables tables={inspection.methodTables} selected={inspection.methodTable} disabled={busy}
+              onSelect={(methodTable) => {
+                setSelected([]);
+                analysis.selectMethodTable(methodTable);
+              }} />
+          )}
+          <form className="table-controls dump-sample-controls" onSubmit={(event) => {
+            event.preventDefault();
+            if (!validMinimum || !inspection.methodTable) return;
+            void findSamples(minBytes);
+          }}>
+            <button type="submit" className="btn btn-sm" disabled={busy || !validMinimum || !inspection.methodTable}>
+              {sampled ? 'Refresh objects' : 'Find objects'}
+            </button>
+            <details className="dump-sample-filter">
+              <summary>Object size filter{minBytes > 0 && validMinimum ? ` · ≥ ${formatBytes(minBytes)}` : ''}</summary>
+              <label className="field">
+                <span className="field-label">Minimum object size (KiB)</span>
+                <input className="input input-sm" type="number" min={0} step={1} value={minKiB}
+                  aria-invalid={!validMinimum}
+                  disabled={busy} onChange={(event) => setMinKiB(event.target.value)} />
               </label>
-            </div>
-          </>
-        )}
-        {roots && <RootEvidence analysis={analysis} roots={roots} />}
+              {!validMinimum && <span className="inline-error">Enter a whole number of KiB, starting at 0.</span>}
+            </details>
+          </form>
+          {sampled === null && <p className="caveat">Find sample objects, then trace up to three back to their GC roots.</p>}
+          {sampled?.length === 0 && <div className="dump-sample-empty">
+            <p className="dim">No objects match this size filter.</p>
+            {minBytes > 0 && <button type="button" className="btn btn-sm" disabled={busy} onClick={() => {
+              setMinKiB('0');
+              void findSamples(0);
+            }}>Find without size filter</button>}
+          </div>}
+          {sampled && sampled.length > 0 && (
+            <>
+              <div className="dump-allocation-row dump-selection-actions">
+                <span className="field-label" role="status">{candidates.length} / 3 selected</span>
+                <div className="table-controls">
+                  <button type="button" className="btn btn-sm btn-ghost" disabled={busy}
+                    onClick={() => setSelected(sampled.slice(0, 3).map((object) => object.address))}>Select first 3</button>
+                  <button type="button" className="btn btn-sm btn-ghost" disabled={busy || !selected.length}
+                    onClick={() => setSelected([])}>Clear selection</button>
+                </div>
+              </div>
+              <div className="dump-object-list">
+                {sampled.map((object) => (
+                  <label key={object.address} className={selected.includes(object.address) ? 'is-selected' : undefined}>
+                    <input type="checkbox" checked={selected.includes(object.address)}
+                      disabled={busy || (selected.length >= 3 && !selected.includes(object.address))}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        setSelected(checked
+                          ? [...selected, object.address]
+                          : selected.filter((address) => address !== object.address));
+                      }} />
+                    <code>{object.address}</code>
+                    <span>{formatBytes(object.sizeBytes)}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="table-controls dump-root-actions">
+                <button className="btn btn-primary btn-sm" type="button" disabled={busy || !candidates.length}
+                  onClick={() => void analysis.inspectRoots(candidates.map((object) => object.address), skipStacks)}>
+                  Find GC roots{candidates.length ? ` (${candidates.length})` : ''}
+                </button>
+                <details className="dump-root-options">
+                  <summary>Search options{skipStacks ? ' · stacks excluded' : ''}</summary>
+                  <label className="dump-growth-filter">
+                    <input type="checkbox" checked={skipStacks} disabled={busy}
+                      onChange={(event) => analysis.updateInspection({ skipStacks: event.target.checked })} />
+                    Skip stack roots
+                  </label>
+                  <p className="caveat">Search GC handles and finalizer roots.</p>
+                </details>
+              </div>
+            </>
+          )}
+        </details>
+        {roots && <RootEvidence analysis={analysis} roots={roots} change={change} baseline={baseline} />}
       </div>
     </section>
   );
@@ -171,17 +257,13 @@ function TypeHistory({ reports, typeName }: { reports: DumpAnalysis[]; typeName:
   );
 }
 
-function traceKey(trace: AllocationSiteData): string {
-  return JSON.stringify([trace.captureFile, trace.windowStartUnixMs, trace.windowEndUnixMs]);
-}
-
 function AllocationEvidence({ traces, typeName, selectedTrace, linkTrace }: {
   traces: AllocationSiteData[];
   typeName: string;
   selectedTrace: string;
   linkTrace: (trace: string) => void;
 }) {
-  const trace = traces.find((item) => traceKey(item) === selectedTrace);
+  const trace = traces.find((item) => allocationTraceKey(item) === selectedTrace);
   const allocation = trace?.types.find((type) => type.typeName === typeName);
   return (
     <div className="dump-inspection-part">
@@ -191,7 +273,7 @@ function AllocationEvidence({ traces, typeName, selectedTrace, linkTrace }: {
           <span className="field-label">Allocation trace for this dump</span>
           <select className="input input-sm" value={trace ? selectedTrace : ''} onChange={(event) => linkTrace(event.target.value)}>
             <option value="">Choose the trace from the same process run…</option>
-            {traces.map((item) => <option key={traceKey(item)} value={traceKey(item)}>
+            {traces.map((item) => <option key={allocationTraceKey(item)} value={allocationTraceKey(item)}>
               {fileNameOf(item.captureFile)} · {new Date(item.windowStartUnixMs).toLocaleString()}
             </option>)}
           </select>
@@ -216,7 +298,9 @@ function AllocationEvidence({ traces, typeName, selectedTrace, linkTrace }: {
           </ul>
         </>
       ) : trace ? <p className="dim">The selected trace has no samples for this type.</p>
-        : traces.length === 0 && <p className="dim">Finish a deep capture or replay a recording with allocation sites.</p>}
+        : <p className="dim">{traces.length === 0
+          ? 'Finish a deep capture or replay a recording with allocation sites to see where this type was created.'
+          : 'Choose a trace captured from the same process run to see allocation call stacks.'}</p>}
     </div>
   );
 }
@@ -227,13 +311,24 @@ function holderAddress(path: DumpRootPath): string | null {
   return path.frames[index].address;
 }
 
-function RootEvidence({ roots, analysis }: { roots: NonNullable<NonNullable<Analysis['inspection']>['roots']>; analysis: Analysis }) {
-  const [selectedPath, setSelectedPath] = useState('');
+function RootEvidence({ roots, analysis, change, baseline }: {
+  roots: NonNullable<NonNullable<Analysis['inspection']>['roots']>;
+  analysis: Analysis;
+  change: DumpTypeChange | null;
+  baseline: DumpAnalysis | null;
+}) {
+  const selectedPath = analysis.inspection?.rootAddress;
   const path = roots.paths.find((entry) => entry.address === selectedPath) ?? roots.paths[0];
   const holder = path ? holderAddress(path) : null;
   const sharedHolderCount = holder ? roots.paths.filter((entry) => holderAddress(entry) === holder).length : 0;
   return (
     <div className="dump-root-evidence">
+      <h3>GC root results</h3>
+      <dl className="dump-root-summary">
+        <div><dt>Rooted</dt><dd>{roots.paths.length}</dd></div>
+        <div><dt>{roots.skipStacks ? 'No non-stack root' : 'No root found'}</dt><dd>{roots.unrooted.length}</dd></div>
+        <div className={roots.failures.length ? 'has-failures' : undefined}><dt>Failed</dt><dd>{roots.failures.length}</dd></div>
+      </dl>
       <div className="dump-allocation-row">
         <p className="caveat" role="status">
           Found a GC path for {roots.paths.length} of {roots.samplesChecked} selected objects.
@@ -241,7 +336,8 @@ function RootEvidence({ roots, analysis }: { roots: NonNullable<NonNullable<Anal
         </p>
         {path && <label className="field">
           <span className="field-label">Root path for object</span>
-          <select className="input input-sm" value={path.address} onChange={(event) => setSelectedPath(event.target.value)}>
+          <select className="input input-sm" value={path.address}
+            onChange={(event) => analysis.updateInspection({ rootAddress: event.target.value })}>
             {roots.paths.map((entry) => <option key={entry.address}>{entry.address}</option>)}
           </select>
         </label>}
@@ -259,19 +355,28 @@ function RootEvidence({ roots, analysis }: { roots: NonNullable<NonNullable<Anal
           </li>)}
         </ul>
       )}
-      {sharedHolderCount > 1 && <p className="dump-growth">Holder <code>{holder}</code> appears in {sharedHolderCount} paths.</p>}
       {path && <>
-        {path.rootKind && <p>Root · <strong>{path.rootKind}</strong>{path.stackMethod && <> · <code>{path.stackMethod}</code></>}</p>}
-        <RootPath key={path.address} analysis={analysis} path={path} />
+        <RootPath key={path.address} analysis={analysis} path={path} change={change} baseline={baseline}
+          sharedHolderCount={sharedHolderCount} samplesChecked={roots.samplesChecked} />
       </>}
     </div>
   );
 }
 
-function RootPath({ path, analysis }: { path: DumpRootPath; analysis: Analysis }) {
+function RootPath({ path, analysis, change, baseline, sharedHolderCount, samplesChecked }: {
+  path: DumpRootPath;
+  analysis: Analysis;
+  change: DumpTypeChange | null;
+  baseline: DumpAnalysis | null;
+  sharedHolderCount: number;
+  samplesChecked: number;
+}) {
   const initialIndex = path.applicationFrameIndex ?? Math.max(0, path.frames.length - 2);
-  const [selectedIndex, setSelectedIndex] = useState(initialIndex);
-  const [reference, setReference] = useState(path.reference);
+  const rootView = analysis.inspection?.rootViews[path.address];
+  const selectedIndex = rootView?.frameIndex ?? initialIndex;
+  const reference = rootView ? rootView.reference : path.reference;
+  const expandedGroups = rootView?.expandedGroups ?? [];
+  const items = useMemo(() => groupDumpChain(path.frames, path.applicationFrameIndex), [path]);
   const selected = path.frames[selectedIndex];
   const stackMethod = path.stackMethod?.split('(')[0];
   const typePrefix = selected && `${selected.typeName}.`;
@@ -280,51 +385,110 @@ function RootPath({ path, analysis }: { path: DumpRootPath; analysis: Analysis }
     : null;
 
   async function inspect(index: number) {
-    setSelectedIndex(index);
-    setReference(null);
+    analysis.updateRootView(path.address, { frameIndex: index, reference: null, source: null });
     const frame = path.frames[index];
     const child = path.frames[index + 1]?.address ?? null;
-    setReference(await analysis.inspectReference(frame.address, child));
+    const inspected = await analysis.inspectReference(frame.address, child);
+    if (inspected) analysis.updateRootView(path.address, { reference: inspected });
+  }
+
+  function frameButton(index: number) {
+    const frame = path.frames[index];
+    return (
+      <li key={frame.address}>
+        <button type="button" className="btn btn-sm btn-ghost" title={frame.typeName}
+          aria-pressed={index === selectedIndex} disabled={analysis.phase !== 'idle'}
+          onClick={() => void inspect(index)}>
+          {(index === 0 || index === path.frames.length - 1) && <span className="field-label">
+            {index === 0 && 'GC root'}{index === 0 && index === path.frames.length - 1 && ' · '}
+            {index === path.frames.length - 1 && 'Selected instance'}
+          </span>}
+          <code>{friendlyFrame(frame.typeName)}</code>
+          <code className="dim">{frame.address}</code>
+          {frame.staticField && <span className="dim">{frame.staticField}</span>}
+        </button>
+      </li>
+    );
   }
 
   return (
     <>
-      {selected && (
-        <div className="dump-owner">
-          <span className="field-label">
-            {selectedIndex === path.applicationFrameIndex ? 'Likely application holder' : 'Selected object'}
-          </span>
-          <strong title={selected.typeName}>{friendlyFrame(selected.typeName)}</strong>
-          {selected.staticField && <span>Static field <code>{selected.staticField}</code></span>}
-          {!!reference?.fields.length && (
-            <span>Reference field <code title={reference.fields.join(', ')}>
-              {reference.fields.map(friendlyField).join(', ')}
-            </code></span>
-          )}
-          {reference && path.frames[selectedIndex + 1] && !reference.fields.length && (
-            <span className="dim">SOS did not identify a named field for this link.</span>
-          )}
-          {reference && <ReferenceSource key={selected.address} analysis={analysis} reference={reference} methodName={methodName} />}
-          {!reference && (
-            <button type="button" className="btn btn-sm btn-ghost" disabled={analysis.phase !== 'idle'}
-              onClick={() => void inspect(selectedIndex)}>Inspect fields and symbols</button>
-          )}
+      <section className="dump-finding" aria-label="Retention evidence">
+        <div className="dump-allocation-row">
+          <h3>Retention evidence</h3>
+          {path.rootKind && <span className="dim">{path.rootKind}</span>}
         </div>
-      )}
+        <p className="dump-finding-type"><code>{analysis.inspection?.typeName}</code></p>
+        <dl className="dump-finding-metrics">
+          <div>
+            <dt>{baseline ? 'Type growth' : 'Type memory'}</dt>
+            <dd className={baseline && change && change.deltaBytes > 0 ? 'dump-growth' : undefined}>
+              {baseline && change
+                ? `${change.deltaBytes > 0 ? '+' : ''}${formatBytes(change.deltaBytes)}`
+                : formatBytes(change?.totalBytes ?? 0)}
+            </dd>
+            {baseline && <dd className="dump-finding-caption dim" title={baseline.path}>vs {fileNameOf(baseline.path)}</dd>}
+          </div>
+          <div>
+            <dt>Paths sharing a holder</dt>
+            <dd>{sharedHolderCount ? `${sharedHolderCount} / ${samplesChecked}` : '—'}</dd>
+            <dd className="dump-finding-caption dim">selected objects searched</dd>
+          </div>
+        </dl>
+        {selected && (
+          <div className="dump-owner">
+            <span className="field-label">
+              {selectedIndex === path.applicationFrameIndex ? 'Likely application holder' : 'Selected object'}
+            </span>
+            <strong title={selected.typeName}>{friendlyFrame(selected.typeName)}</strong>
+            {selected.staticField && <span>Static field <code>{selected.staticField}</code></span>}
+            {!!reference?.fields.length && (
+              <span>Reference field <code title={reference.fields.join(', ')}>
+                {reference.fields.map(friendlyField).join(', ')}
+              </code></span>
+            )}
+            {reference && path.frames[selectedIndex + 1] && !reference.fields.length && (
+              <span className="dim">SOS did not identify a named field for this link.</span>
+            )}
+            {selectedIndex !== initialIndex && <button type="button" className="btn btn-sm btn-ghost"
+              disabled={analysis.phase !== 'idle'} onClick={() => void inspect(initialIndex)}>
+              {path.applicationFrameIndex === null ? 'Show sampled holder' : 'Show application holder'}
+            </button>}
+            {path.stackMethod && <span className="dump-root-origin">Stack method <code>{path.stackMethod}</code></span>}
+            {reference && <ReferenceSource key={selected.address} analysis={analysis} reference={reference} methodName={methodName}
+              source={rootView?.source ?? null} onSource={(source) => analysis.updateRootView(path.address, { source })} />}
+            {!reference && (
+              <button type="button" className="btn btn-sm btn-ghost" disabled={analysis.phase !== 'idle'}
+                onClick={() => void inspect(selectedIndex)}>Inspect fields and symbols</button>
+            )}
+          </div>
+        )}
+      </section>
       {path.frames.length > 0 && (
-        <ol className="dump-reference-chain" aria-label="References from GC root to selected instance">
-          {path.frames.map((frame, index) => (
-            <li key={`${frame.address}|${index}`}>
-              <button type="button" className="btn btn-sm btn-ghost" title={frame.typeName}
-                aria-pressed={index === selectedIndex} disabled={analysis.phase !== 'idle'}
-                onClick={() => void inspect(index)}>
-                <code>{friendlyFrame(frame.typeName)}</code>
-                <code className="dim">{frame.address}</code>
-                {frame.staticField && <span className="dim">{frame.staticField}</span>}
-              </button>
-            </li>
-          ))}
-        </ol>
+        <div className="dump-chain">
+          <h3>Reference chain</h3>
+          <p className="caveat">Select an object to inspect its fields and source.</p>
+          <ol className="dump-reference-chain" aria-label="References from GC root to selected instance">
+            {items.map((item) => {
+              if (item.kind === 'frame') return frameButton(item.index);
+              const expanded = expandedGroups.includes(item.start);
+              const containsSelected = selectedIndex >= item.start && selectedIndex < item.end;
+              const groupId = `dump-framework-${item.start}`;
+              return <li className="dump-framework-group" key={item.start}>
+                <button type="button" className="btn btn-sm btn-ghost" aria-expanded={expanded} aria-controls={groupId}
+                  onClick={() => analysis.updateRootView(path.address, {
+                    expandedGroups: expanded ? expandedGroups.filter((start) => start !== item.start) : [...expandedGroups, item.start],
+                  })}>
+                  <span>{expanded ? 'Hide' : 'Show'} {item.end - item.start} framework objects</span>
+                  {containsSelected && <span className="dim">Includes the selected object</span>}
+                </button>
+                <ol className="dump-reference-chain" id={groupId} hidden={!expanded}>
+                  {Array.from({ length: item.end - item.start }, (_, offset) => frameButton(item.start + offset))}
+                </ol>
+              </li>;
+            })}
+          </ol>
+        </div>
       )}
       <details open={path.frames.length === 0}>
         <summary>SOS output</summary>
@@ -346,12 +510,13 @@ function friendlyField(field: string): string {
   return field.match(/^<([^<>]+)>5__\d+$/)?.[1] ?? field;
 }
 
-function ReferenceSource({ analysis, reference, methodName }: {
+function ReferenceSource({ analysis, reference, methodName, source, onSource }: {
   analysis: Analysis;
   reference: DumpReference;
   methodName: string | null;
+  source: DumpSourceLocation | null;
+  onSource: (source: DumpSourceLocation) => void;
 }) {
-  const [source, setSource] = useState<DumpSourceLocation | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const disabled = busy || analysis.phase !== 'idle';
@@ -363,7 +528,7 @@ function ReferenceSource({ analysis, reference, methodName }: {
       const assembly = chooseAssembly ? await dumpApi.pick('assembly') : reference.assemblyPath;
       if (!assembly) return;
       const match = await analysis.resolveSource(assembly, reference, methodName);
-      if (match) setSource(match);
+      if (match) onSource(match);
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     } finally {

@@ -132,6 +132,8 @@ pub fn run() {
             commands::delete_recording,
             commands::reveal_in_folder,
             commands::pick_dump,
+            commands::pick_dumps,
+            commands::save_dump_report,
             commands::analyze_dump,
             commands::sample_dump_objects,
             commands::inspect_dump_roots,

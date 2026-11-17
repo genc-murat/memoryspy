@@ -535,6 +535,65 @@ pub async fn pick_dump(window: tauri::WebviewWindow, kind: Option<String>) -> Re
 }
 
 #[tauri::command]
+pub async fn pick_dumps(window: tauri::WebviewWindow) -> Result<Option<Vec<String>>, String> {
+    let dialog = window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Open .NET memory dumps")
+        .add_filter("Memory dumps", &["dmp", "dump", "core"])
+        .add_filter("All files", &["*"]);
+    tauri::async_runtime::spawn_blocking(move || {
+        dialog
+            .blocking_pick_files()
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| {
+                        file.into_path()
+                            .map_err(|error| error.to_string())?
+                            .into_os_string()
+                            .into_string()
+                            .map_err(|_| "This file path cannot be represented as text.".to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_dump_report(
+    window: tauri::WebviewWindow,
+    file_name: String,
+    markdown: String,
+) -> Result<Option<String>, String> {
+    let dialog = window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Save investigation report")
+        .set_file_name(file_name)
+        .add_filter("Markdown report", &["md"]);
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(file) = dialog.blocking_save_file() else {
+            return Ok(None);
+        };
+        let path = file.into_path().map_err(|error| error.to_string())?;
+        if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("md")) {
+            return Err("Choose a file ending in .md for the investigation report.".to_string());
+        }
+        std::fs::write(&path, markdown)
+            .map_err(|error| format!("Could not save report to {}: {error}", path.display()))?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn analyze_dump(
     state: State<'_, AppState>,
     path: String,

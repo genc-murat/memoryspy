@@ -65,7 +65,7 @@ export function compareDumpTypes(captures: DumpType[][]): DumpTypeChange[] {
       if ((current?.objectCount ?? 0) > (previous?.objectCount ?? 0)) growingCountIntervals += 1;
     }
     const methodTables = Array.from(next?.tables.values() ?? [], (table) => {
-      const oldTable = old?.tables.get(table.methodTable);
+      const oldTable = captures.length > 1 ? old?.tables.get(table.methodTable) : undefined;
       return {
         ...table,
         baselineCount: oldTable?.objectCount ?? null,

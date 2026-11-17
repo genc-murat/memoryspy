@@ -133,6 +133,8 @@ function dumpProgress(receive: (message: string) => void) {
 
 export const dumpApi = {
   pick: (kind?: 'assembly' | 'source') => call<string | null>('pick_dump', { kind: kind ?? null }),
+  pickDumps: () => call<string[] | null>('pick_dumps'),
+  saveReport: (fileName: string, markdown: string) => call<string | null>('save_dump_report', { fileName, markdown }),
   analyze: (path: string, reachableOnly: boolean, progress: (message: string) => void) =>
     call<DumpAnalysis | null>('analyze_dump', { path, reachableOnly, progress: dumpProgress(progress) }),
   sampleObjects: (report: DumpAnalysis, methodTable: string, minBytes: number, progress: (message: string) => void) =>

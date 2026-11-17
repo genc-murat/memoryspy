@@ -84,6 +84,10 @@ yapıştır, ardından **Analyze** düğmesine bas. Sekme yönetilen heap’teki
 kaplanan belleği tür bazında gösterir. Sonuçları filtreleyebilir ve bayta veya nesne sayısına
 göre sıralayabilirsin. Heap’teki boş bloklar ayrı gösterilir.
 
+**Heap scope** alanındaki **Reachable objects only** seçeneği, SOS’un GC köklerinden erişebildiği
+nesneleri sayar. Bu tarama büyük heap’lerde daha fazla zaman ve RAM kullanabilir. Aynı dosyanın
+iki kapsamda alınmış özetleri birlikte açılabilir. Büyüme karşılaştırmaları aynı kapsamı kullanır.
+
 Sızıntıyı araştırırken aynı süreçten benzer yük altında ayrı dump’lar al. Dosyaları alınma
 sırasıyla aç ve ilkini **Use as baseline** ile seç. **Type growth since baseline** tablosu
 nesne sayısı ve bayt değişimini gösterir. Üç veya daha fazla dump ile her aralıkta büyüyen
@@ -98,6 +102,12 @@ bölümünde aynı süreç çalışmasına ait Call Sites kaydını seçerek olu
 bölümünde minimum nesne boyutunu gir, **Find objects** ile örnekleri listele ve en fazla
 üç nesneyi seçip **Find GC roots** düğmesine bas. Zincirdeki bir nesneyi seçtiğinde, SOS’un
 doğrulayabildiği doğrudan referans alanları gösterilir.
+
+Her nesnenin sonucu ayrı görünür. Bir arama başarısız olursa diğer nesnelerin zincirleri
+incelenebilir. Zincir, SOS’un bildirdiği kök türünü (thread stack, GC handle veya finalizer queue)
+ve üzerindeki nesne adreslerini gösterir. **Skip stack roots** ile handle ve finalizer
+yollarını arayabilirsin. Stack kökleri dışlandığında sonuç, nesnenin stack üzerinden erişilebilirliği
+hakkında bilgi vermez.
 
 **Find source in PDB**, assembly’nin derleme kimliğini dump’taki kayıtla doğrulayıp
 eşleşen Portable PDB ile C# kaynak konumunu çözer. Dump başka

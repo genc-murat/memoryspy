@@ -133,20 +133,21 @@ function dumpProgress(receive: (message: string) => void) {
 
 export const dumpApi = {
   pick: (kind?: 'assembly' | 'source') => call<string | null>('pick_dump', { kind: kind ?? null }),
-  analyze: (path: string, progress: (message: string) => void) =>
-    call<DumpAnalysis | null>('analyze_dump', { path, progress: dumpProgress(progress) }),
+  analyze: (path: string, reachableOnly: boolean, progress: (message: string) => void) =>
+    call<DumpAnalysis | null>('analyze_dump', { path, reachableOnly, progress: dumpProgress(progress) }),
   sampleObjects: (report: DumpAnalysis, methodTable: string, minBytes: number, progress: (message: string) => void) =>
     call<DumpObject[] | null>('sample_dump_objects', {
-      path: report.path, dumpId: report.id, methodTable, minBytes, progress: dumpProgress(progress),
+      path: report.path, dumpId: report.id, methodTable, minBytes, reachableOnly: report.reachableOnly,
+      progress: dumpProgress(progress),
     }),
-  inspectRoots: (report: DumpAnalysis, addresses: string[], progress: (message: string) => void) =>
+  inspectRoots: (report: DumpAnalysis, addresses: string[], skipStacks: boolean, progress: (message: string) => void) =>
     call<DumpRoots | null>('inspect_dump_roots', {
-      path: report.path, dumpId: report.id, addresses, progress: dumpProgress(progress),
+      path: report.path, dumpId: report.id, addresses, skipStacks, progress: dumpProgress(progress),
     }),
   inspectReference: (report: DumpAnalysis, parent: string, child: string | null) =>
     call<DumpReference | null>('inspect_dump_reference', { path: report.path, dumpId: report.id, parent, child }),
   resolveSource: (report: DumpAnalysis, assembly: string, methodTable: string, typeName: string, methodName: string | null) =>
-    call<DumpSourceLocation>('resolve_dump_source', { path: report.path, dumpId: report.id, assembly, methodTable, typeName, methodName }),
+    call<DumpSourceLocation | null>('resolve_dump_source', { path: report.path, dumpId: report.id, assembly, methodTable, typeName, methodName }),
   previewSource: (path: string, line: number, sha256?: string | null) =>
     call<SourcePreview>('preview_dump_source', { path, line, sha256: sha256 ?? null }),
   cancel: () => call<void>('cancel_dump_analysis'),

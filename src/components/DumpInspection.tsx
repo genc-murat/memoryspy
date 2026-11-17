@@ -34,6 +34,7 @@ function Inspection({ analysis, inspection, traces, reports }: {
   const details = useRef<HTMLElement>(null);
   const [minKiB, setMinKiB] = useState('0');
   const [selected, setSelected] = useState<string[]>([]);
+  const [skipStacks, setSkipStacks] = useState(false);
   const busy = analysis.phase !== 'idle';
   const minBytes = Number(minKiB) * 1024;
   const validMinimum = minKiB.trim() !== '' && Number.isInteger(Number(minKiB)) &&
@@ -97,15 +98,19 @@ function Inspection({ analysis, inspection, traces, reports }: {
                 </label>
               ))}
             </div>
-            <button className="btn btn-primary btn-sm" type="button" disabled={busy || !candidates.length}
-              onClick={() => void analysis.inspectRoots(candidates.map((object) => object.address))}>
-              Find GC roots{candidates.length ? ` (${candidates.length})` : ''}
-            </button>
+            <div className="table-controls dump-root-actions">
+              <button className="btn btn-primary btn-sm" type="button" disabled={busy || !candidates.length}
+                onClick={() => void analysis.inspectRoots(candidates.map((object) => object.address), skipStacks)}>
+                Find GC roots{candidates.length ? ` (${candidates.length})` : ''}
+              </button>
+              <label className="dump-growth-filter">
+                <input type="checkbox" checked={skipStacks} disabled={busy} onChange={(event) => setSkipStacks(event.target.checked)} />
+                Skip stack roots
+              </label>
+            </div>
           </>
         )}
-        {roots && (roots.paths.length
-          ? <RootEvidence key={roots.paths.map((path) => path.address).join(',')} analysis={analysis} roots={roots} />
-          : <p className="dim" role="status">No GC path found for the {roots.samplesChecked} selected objects.</p>)}
+        {roots && <RootEvidence analysis={analysis} roots={roots} />}
       </div>
     </section>
   );
@@ -141,11 +146,16 @@ function MethodTables({ tables, selected, disabled, onSelect }: {
 }
 
 function TypeHistory({ reports, typeName }: { reports: DumpAnalysis[]; typeName: string }) {
-  const counts = reports.map((report) => report.types.reduce((count, type) =>
-    type.typeName === typeName ? count + type.objectCount : count, 0));
+  const totals = useMemo(() => reports.map((report) => report.types.reduce((total, type) => {
+    if (type.typeName === typeName) {
+      total.count += type.objectCount;
+      total.bytes += type.totalBytes;
+    }
+    return total;
+  }, { count: 0, bytes: 0 })), [reports, typeName]);
   return (
     <div className="dump-inspection-part">
-      <h3>Objects across captures</h3>
+      <h3>Type growth across captures</h3>
       <ul className="dump-history-values">
         {reports.map((report, index) => (
           <li key={report.id} title={report.path}>
@@ -153,7 +163,7 @@ function TypeHistory({ reports, typeName }: { reports: DumpAnalysis[]; typeName:
               {reports.some((other) => other.id !== report.id && fileNameOf(other.path) === fileNameOf(report.path))
                 ? ` · capture ${index + 1}` : ''}
             </span>
-            <strong>{counts[index].toLocaleString()}</strong>
+            <strong>{totals[index].count.toLocaleString()} objects · {formatBytes(totals[index].bytes)}</strong>
           </li>
         ))}
       </ul>
@@ -211,31 +221,49 @@ function AllocationEvidence({ traces, typeName, selectedTrace, linkTrace }: {
   );
 }
 
-function ownerKey(path: DumpRootPath): string {
+function holderAddress(path: DumpRootPath): string | null {
+  if (path.frames.length < 2) return null;
   const index = path.applicationFrameIndex ?? Math.max(0, path.frames.length - 2);
-  const owner = path.frames[index];
-  const child = path.frames[index + 1];
-  return owner && child ? JSON.stringify([owner.address, child.typeName, path.reference?.fields ?? []]) : path.address;
+  return path.frames[index].address;
 }
 
 function RootEvidence({ roots, analysis }: { roots: NonNullable<NonNullable<Analysis['inspection']>['roots']>; analysis: Analysis }) {
   const [selectedPath, setSelectedPath] = useState('');
   const path = roots.paths.find((entry) => entry.address === selectedPath) ?? roots.paths[0];
-  const sameOwner = roots.paths.filter((entry) => ownerKey(entry) === ownerKey(path)).length;
+  const holder = path ? holderAddress(path) : null;
+  const sharedHolderCount = holder ? roots.paths.filter((entry) => holderAddress(entry) === holder).length : 0;
   return (
     <div className="dump-root-evidence">
       <div className="dump-allocation-row">
-        <p className="caveat">{roots.paths.length} of {roots.samplesChecked} selected objects have a GC path.</p>
-        <label className="field">
+        <p className="caveat" role="status">
+          Found a GC path for {roots.paths.length} of {roots.samplesChecked} selected objects.
+          {roots.skipStacks && ' Stack roots were excluded.'}
+        </p>
+        {path && <label className="field">
           <span className="field-label">Root path for object</span>
           <select className="input input-sm" value={path.address} onChange={(event) => setSelectedPath(event.target.value)}>
             {roots.paths.map((entry) => <option key={entry.address}>{entry.address}</option>)}
           </select>
-        </label>
+        </label>}
       </div>
-      {sameOwner > 1 && <p className="dump-growth">Same holder and reference in {sameOwner} of {roots.samplesChecked} selected objects.</p>}
-      {path.stackMethod && <p>Stack root in <code>{path.stackMethod}</code></p>}
-      <RootPath key={path.address} analysis={analysis} path={path} />
+      {(roots.unrooted.length > 0 || roots.failures.length > 0) && (
+        <ul className="dump-root-outcomes">
+          {roots.unrooted.map((address) => <li className="dim" key={address}>
+            <code>{address}</code> · {roots.skipStacks ? 'No non-stack root found' : 'No GC root found'}
+          </li>)}
+          {roots.failures.map(({ address, message }) => <li key={address}>
+            <details>
+              <summary><code>{address}</code> · GC root search failed</summary>
+              <p className="dump-error">{message}</p>
+            </details>
+          </li>)}
+        </ul>
+      )}
+      {sharedHolderCount > 1 && <p className="dump-growth">Holder <code>{holder}</code> appears in {sharedHolderCount} paths.</p>}
+      {path && <>
+        {path.rootKind && <p>Root · <strong>{path.rootKind}</strong>{path.stackMethod && <> · <code>{path.stackMethod}</code></>}</p>}
+        <RootPath key={path.address} analysis={analysis} path={path} />
+      </>}
     </div>
   );
 }
@@ -273,7 +301,10 @@ function RootPath({ path, analysis }: { path: DumpRootPath; analysis: Analysis }
               {reference.fields.map(friendlyField).join(', ')}
             </code></span>
           )}
-          {analysis.result && <ReferenceSource key={selected.address} report={analysis.result} reference={reference} methodName={methodName} />}
+          {reference && path.frames[selectedIndex + 1] && !reference.fields.length && (
+            <span className="dim">SOS did not identify a named field for this link.</span>
+          )}
+          {reference && <ReferenceSource key={selected.address} analysis={analysis} reference={reference} methodName={methodName} />}
           {!reference && (
             <button type="button" className="btn btn-sm btn-ghost" disabled={analysis.phase !== 'idle'}
               onClick={() => void inspect(selectedIndex)}>Inspect fields and symbols</button>
@@ -288,6 +319,7 @@ function RootPath({ path, analysis }: { path: DumpRootPath; analysis: Analysis }
                 aria-pressed={index === selectedIndex} disabled={analysis.phase !== 'idle'}
                 onClick={() => void inspect(index)}>
                 <code>{friendlyFrame(frame.typeName)}</code>
+                <code className="dim">{frame.address}</code>
                 {frame.staticField && <span className="dim">{frame.staticField}</span>}
               </button>
             </li>
@@ -295,7 +327,7 @@ function RootPath({ path, analysis }: { path: DumpRootPath; analysis: Analysis }
         </ol>
       )}
       <details open={path.frames.length === 0}>
-        <summary>Full SOS output</summary>
+        <summary>SOS output</summary>
         <pre tabIndex={0}>{path.trace}</pre>
         {path.traceTruncated && <p className="caveat">SOS output was shortened.</p>}
       </details>
@@ -314,20 +346,24 @@ function friendlyField(field: string): string {
   return field.match(/^<([^<>]+)>5__\d+$/)?.[1] ?? field;
 }
 
-function ReferenceSource({ report, reference, methodName }: { report: DumpAnalysis; reference: DumpReference | null; methodName: string | null }) {
+function ReferenceSource({ analysis, reference, methodName }: {
+  analysis: Analysis;
+  reference: DumpReference;
+  methodName: string | null;
+}) {
   const [source, setSource] = useState<DumpSourceLocation | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  if (!reference) return null;
-  const inspected = reference;
+  const disabled = busy || analysis.phase !== 'idle';
 
   async function locate(chooseAssembly: boolean) {
     setError(null);
     setBusy(true);
     try {
-      const assembly = chooseAssembly ? await dumpApi.pick('assembly') : inspected.assemblyPath;
+      const assembly = chooseAssembly ? await dumpApi.pick('assembly') : reference.assemblyPath;
       if (!assembly) return;
-      setSource(await dumpApi.resolveSource(report, assembly, inspected.methodTable, inspected.typeName, methodName));
+      const match = await analysis.resolveSource(assembly, reference, methodName);
+      if (match) setSource(match);
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -345,9 +381,9 @@ function ReferenceSource({ report, reference, methodName }: { report: DumpAnalys
         </>
       ) : (
         <div className="table-controls">
-          {reference.assemblyPath && <button type="button" className="btn btn-sm" disabled={busy}
+          {reference.assemblyPath && <button type="button" className="btn btn-sm" disabled={disabled}
             onClick={() => void locate(false)}>Find source in PDB</button>}
-          <button type="button" className="btn btn-sm btn-ghost" disabled={busy}
+          <button type="button" className="btn btn-sm btn-ghost" disabled={disabled}
             onClick={() => void locate(true)}>Choose assembly from dump build…</button>
         </div>
       )}

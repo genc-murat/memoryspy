@@ -2254,6 +2254,14 @@ code {
   flex-basis: 220px;
 }
 
+.dump-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 6px 12px;
+  margin-top: 10px;
+}
+
 .dump-file-name {
   overflow-wrap: anywhere;
 }
@@ -2459,6 +2467,16 @@ code {
 
 .dump-root-evidence {
   margin-top: 10px;
+}
+
+.dump-root-actions {
+  flex-wrap: wrap;
+}
+
+.dump-root-outcomes {
+  display: grid;
+  gap: 4px;
+  padding-inline-start: 20px;
 }
 
 .dump-growth {

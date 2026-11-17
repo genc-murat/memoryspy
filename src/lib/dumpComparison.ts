@@ -1,4 +1,8 @@
-import type { DumpMethodTable, DumpType } from './types';
+import type { DumpAnalysis, DumpMethodTable, DumpType } from './types';
+
+export function dumpReportKey(report: DumpAnalysis): string {
+  return `${report.id}:${report.reachableOnly ? 'reachable' : 'all'}`;
+}
 
 export interface DumpTypeChange {
   typeName: string;

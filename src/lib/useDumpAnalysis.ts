@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react';
 
+import { dumpReportKey } from './dumpComparison';
 import { dumpApi } from './ipc';
-import type { DumpAnalysis, DumpMethodTable, DumpObject, DumpRoots } from './types';
+import type { DumpAnalysis, DumpMethodTable, DumpObject, DumpReference, DumpRoots } from './types';
 
 interface DumpInspection {
   typeName: string;
@@ -13,9 +14,10 @@ interface DumpInspection {
 
 export function useDumpAnalysis() {
   const [path, setPath] = useState('');
+  const [reachableOnly, setReachableOnly] = useState(false);
   const [reports, setReports] = useState<DumpAnalysis[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
-  const [baselineId, setBaselineId] = useState<string | null>(null);
+  const [baselineIds, setBaselineIds] = useState<Record<'all' | 'reachable', string | null>>({ all: null, reachable: null });
   const [allocationTraces, setAllocationTraces] = useState<Record<string, string>>({});
   const [inspection, setInspection] = useState<DumpInspection | null>(null);
   const [phase, setPhase] = useState<'idle' | 'picking' | 'running' | 'cancelling'>('idle');
@@ -23,13 +25,20 @@ export function useDumpAnalysis() {
   const [status, setStatus] = useState<string | null>(null);
   const [work, setWork] = useState<{ message: string; detail: string; startedAt: number } | null>(null);
   const active = useRef<symbol | null>(null);
-  const result = reports.find((report) => report.id === currentId) ?? null;
-  const baseline = reports.find((report) => report.id === baselineId) ?? null;
+  const result = reports.find((report) => dumpReportKey(report) === currentId) ?? null;
+  const baselineScope = result?.reachableOnly ? 'reachable' : 'all';
+  const baseline = reports.find((report) => dumpReportKey(report) === baselineIds[baselineScope]) ?? null;
+
+  function setBaselineId(id: string | null) {
+    setBaselineIds((current) => ({ ...current, [baselineScope]: id }));
+  }
 
   function viewReport(report: DumpAnalysis) {
-    setCurrentId(report.id);
+    setCurrentId(dumpReportKey(report));
     setPath(report.path);
+    setReachableOnly(report.reachableOnly);
     setInspection(null);
+    setError(null);
   }
 
   async function pick() {
@@ -72,10 +81,12 @@ export function useDumpAnalysis() {
 
   async function analyze() {
     if (!path.trim() || phase !== 'idle') return;
-    const next = await run('Scanning the managed heap…', (progress) => dumpApi.analyze(path, progress));
+    const next = await run(reachableOnly ? 'Finding reachable objects…' : 'Scanning the managed heap…',
+      (progress) => dumpApi.analyze(path, reachableOnly, progress));
     if (next) {
-      setReports((current) => current.some((report) => report.id === next.id)
-        ? current.map((report) => report.id === next.id ? next : report)
+      const key = dumpReportKey(next);
+      setReports((current) => current.some((report) => dumpReportKey(report) === key)
+        ? current.map((report) => dumpReportKey(report) === key ? next : report)
         : [...current, next]);
       viewReport(next);
     }
@@ -103,15 +114,22 @@ export function useDumpAnalysis() {
     if (objects) setInspection({ ...inspection, objects, roots: null });
   }
 
-  async function inspectRoots(addresses: string[]) {
+  async function inspectRoots(addresses: string[], skipStacks: boolean) {
     if (!result || !inspection || phase !== 'idle') return;
-    const roots = await run('Tracing GC roots…', (progress) => dumpApi.inspectRoots(result, addresses, progress));
+    setInspection({ ...inspection, roots: null });
+    const roots = await run('Tracing GC roots…', (progress) => dumpApi.inspectRoots(result, addresses, skipStacks, progress));
     if (roots) setInspection({ ...inspection, roots });
   }
 
   function inspectReference(parent: string, child: string | null) {
     if (!result || phase !== 'idle') return Promise.resolve(null);
     return run('Reading the reference fields…', () => dumpApi.inspectReference(result, parent, child));
+  }
+
+  function resolveSource(assembly: string, reference: DumpReference, methodName: string | null) {
+    if (!result || phase !== 'idle') return Promise.resolve(null);
+    return run('Matching the dump module and PDB…', () =>
+      dumpApi.resolveSource(result, assembly, reference.methodTable, reference.typeName, methodName));
   }
 
   async function cancel() {
@@ -123,8 +141,8 @@ export function useDumpAnalysis() {
   }
 
   return {
-    path, setPath, result, baseline, reports, viewReport, setBaselineId, inspection,
+    path, setPath, reachableOnly, setReachableOnly, result, baseline, reports, viewReport, setBaselineId, inspection,
     allocationTrace: result ? allocationTraces[result.id] ?? '' : '', linkAllocationTrace,
-    phase, error, status, work, pick, analyze, cancel, selectType, selectMethodTable, findObjects, inspectRoots, inspectReference,
+    phase, error, status, work, pick, analyze, cancel, selectType, selectMethodTable, findObjects, inspectRoots, inspectReference, resolveSource,
   };
 }

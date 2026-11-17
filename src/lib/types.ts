@@ -685,6 +685,7 @@ export interface DumpAnalysis {
   id: string;
   path: string;
   durationMs: number;
+  reachableOnly: boolean;
   objectCount: number;
   totalBytes: number;
   freeBytes: number;
@@ -706,7 +707,10 @@ export interface DumpMethodTable extends DumpType {
 
 export interface DumpRoots {
   samplesChecked: number;
+  skipStacks: boolean;
   paths: DumpRootPath[];
+  unrooted: string[];
+  failures: { address: string; message: string }[];
 }
 
 export interface DumpObject {
@@ -723,6 +727,7 @@ export interface DumpRootFrame {
 export interface DumpRootPath {
   address: string;
   frames: DumpRootFrame[];
+  rootKind: string | null;
   applicationFrameIndex: number | null;
   stackMethod: string | null;
   reference: DumpReference | null;

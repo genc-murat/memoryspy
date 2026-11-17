@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { DumpInspection } from './DumpInspection';
-import { compareDumpTypes } from '../lib/dumpComparison';
+import { compareDumpTypes, dumpReportKey } from '../lib/dumpComparison';
 import { fileNameOf, formatBytes, formatDuration, formatMilliseconds, formatPercent } from '../lib/format';
 import { isTauri } from '../lib/ipc';
 import type { AllocationSiteData, DumpAnalysis } from '../lib/types';
@@ -12,7 +12,7 @@ const PAGE_SIZE = 100;
 type Analysis = ReturnType<typeof useDumpAnalysis>;
 
 export function DumpPanel({ analysis, traces }: { analysis: Analysis; traces: AllocationSiteData[] }) {
-  const { path, setPath, result, phase, error, status, work, pick, analyze, cancel } = analysis;
+  const { path, setPath, reachableOnly, setReachableOnly, result, phase, error, status, work, pick, analyze, cancel } = analysis;
   const available = isTauri();
 
   return (
@@ -47,12 +47,23 @@ export function DumpPanel({ analysis, traces }: { analysis: Analysis; traces: Al
             Analyze
           </button>
         </div>
+        <div className="dump-scope">
+          <label className="field">
+            <span className="field-label">Heap scope</span>
+            <select className="input input-sm" value={reachableOnly ? 'reachable' : 'all'}
+              disabled={!available || phase !== 'idle'} onChange={(event) => setReachableOnly(event.target.value === 'reachable')}>
+              <option value="all">All managed objects</option>
+              <option value="reachable">Reachable objects only</option>
+            </select>
+          </label>
+          {reachableOnly && <span className="caveat">Walks the GC reference graph. Large heaps can take more time and RAM.</span>}
+        </div>
       </form>
       {!available && <p className="caveat">Open MemorySpy on the desktop to analyze a local file.</p>}
       {status && <p className="dim" role="status">{status}</p>}
       {error && <div className="inline-error inline-error-wide dump-error dump-operation-error" role="alert">{error}</div>}
       {work && <DumpProgress work={work} cancelling={phase === 'cancelling'} cancel={cancel} />}
-      {result && <DumpResults key={result.id} result={result} analysis={analysis} traces={traces} />}
+      {result && <DumpResults key={dumpReportKey(result)} result={result} analysis={analysis} traces={traces} />}
     </div>
   );
 }
@@ -69,7 +80,7 @@ function DumpProgress({ work, cancelling, cancel }: {
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
   }, [work.startedAt]);
-  const percent = work.detail.match(/\((\d{1,3})%\)/)?.[1];
+  const percent = work.detail.match(/(?:\(|\s)(\d{1,3}(?:\.\d+)?)%(?:\)|\s|$)/)?.[1];
   return (
     <div className="notice notice-info dump-progress">
       <div>
@@ -92,10 +103,13 @@ function DumpResults({ result, analysis, traces }: { result: DumpAnalysis; analy
   const [growingOnly, setGrowingOnly] = useState(true);
   const [everyInterval, setEveryInterval] = useState(false);
   const [page, setPage] = useState(0);
-  const first = baseline ? reports.indexOf(baseline) : -1;
-  const last = reports.indexOf(result);
+  const scopedReports = useMemo(() => reports.filter((report) => report.reachableOnly === result.reachableOnly),
+    [reports, result.reachableOnly]);
+  const first = baseline ? scopedReports.indexOf(baseline) : -1;
+  const last = scopedReports.indexOf(result);
   const comparison = first >= 0 && last > first ? baseline : null;
-  const history = useMemo(() => comparison ? reports.slice(first, last + 1) : reports, [comparison, reports, first, last]);
+  const history = useMemo(() => scopedReports.slice(comparison ? first : 0, last + 1),
+    [comparison, scopedReports, first, last]);
   const intervals = comparison ? history.length - 1 : 0;
 
   const types = useMemo(() => comparison
@@ -138,7 +152,7 @@ function DumpResults({ result, analysis, traces }: { result: DumpAnalysis; analy
       ? signed(result.objectCount - comparison.objectCount, (value) => value.toLocaleString())
       : null },
     { label: 'Type entries', value: result.types.length.toLocaleString() },
-    { label: 'Free block bytes', value: formatBytes(result.freeBytes) },
+    ...(!result.reachableOnly ? [{ label: 'Free block bytes', value: formatBytes(result.freeBytes) }] : []),
   ];
 
   return (
@@ -146,11 +160,11 @@ function DumpResults({ result, analysis, traces }: { result: DumpAnalysis; analy
       <section className="block-head">
         <div>
           <h2 title={result.path} className="dump-file-name">{fileNameOf(result.path)}</h2>
-          <p>Analyzed in {duration}. Counts include objects awaiting collection.</p>
+          <p>Analyzed in {duration}. {result.reachableOnly ? 'Reachable objects only.' : 'Counts include objects awaiting collection.'}</p>
         </div>
         {baseline !== result && (
           <button type="button" className="btn btn-sm" disabled={phase !== 'idle'} onClick={() => {
-            setBaselineId(result.id);
+            setBaselineId(dumpReportKey(result));
             setPage(0);
           }}>
             {baseline ? 'Use as new baseline' : 'Use as baseline'}
@@ -162,7 +176,7 @@ function DumpResults({ result, analysis, traces }: { result: DumpAnalysis; analy
           <div>
             <strong title={baseline.path}>Baseline · {fileNameOf(baseline.path)}</strong>
             <p>{comparison ? `Comparing ${history.length} captures in the order added.`
-              : 'Choose a later dump from the same process to compare growth.'}</p>
+              : 'Choose a later dump from the same process and heap scope to compare growth.'}</p>
           </div>
           <button type="button" className="btn btn-sm btn-ghost" disabled={phase !== 'idle'} onClick={() => {
             setBaselineId(null);
@@ -177,14 +191,16 @@ function DumpResults({ result, analysis, traces }: { result: DumpAnalysis; analy
           <span className="field-label">Captures · in the order added</span>
           <ol>
             {reports.map((report, index) => (
-              <li key={report.id}>
+              <li key={dumpReportKey(report)}>
                 <button type="button" className="btn btn-sm btn-ghost" title={report.path}
                   aria-pressed={report === result} disabled={phase !== 'idle'} onClick={() => viewReport(report)}>
                   <span>{fileNameOf(report.path)}
                     {reports.some((other) => other.id !== report.id && fileNameOf(other.path) === fileNameOf(report.path))
                       ? ` · capture ${index + 1}` : ''}
                   </span>
-                  <span className="dim">{formatBytes(report.totalBytes)}{report === baseline ? ' · baseline' : ''}</span>
+                  <span className="dim">{formatBytes(report.totalBytes)} · {report.reachableOnly ? 'reachable' : 'all objects'}
+                    {report === baseline ? ' · baseline' : ''}
+                  </span>
                 </button>
               </li>
             ))}

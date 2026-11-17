@@ -31,9 +31,11 @@ impl DumpAnalyzer {
     pub async fn analyze(
         &self,
         path: &Path,
+        reachable_only: bool,
         progress: &Channel<String>,
     ) -> Result<Option<DumpAnalysis>, String> {
-        self.run(analyze_file(path.to_owned(), progress)).await
+        self.run(analyze_file(path.to_owned(), reachable_only, progress))
+            .await
     }
 
     pub async fn objects(
@@ -42,6 +44,7 @@ impl DumpAnalyzer {
         dump_id: &str,
         method_table: &str,
         min_bytes: u64,
+        reachable_only: bool,
         progress: &Channel<String>,
     ) -> Result<Option<Vec<DumpObject>>, String> {
         let method_table = parse_address(method_table).ok_or("Invalid method table address.")?;
@@ -52,6 +55,7 @@ impl DumpAnalyzer {
                 &target.path,
                 method_table,
                 min_bytes,
+                reachable_only,
                 progress,
             )
             .await?;
@@ -66,6 +70,7 @@ impl DumpAnalyzer {
         path: &Path,
         dump_id: &str,
         addresses: &[String],
+        skip_stacks: bool,
         progress: &Channel<String>,
     ) -> Result<Option<DumpRoots>, String> {
         if addresses.is_empty() || addresses.len() > 3 {
@@ -85,7 +90,7 @@ impl DumpAnalyzer {
         }
         self.run(async {
             let target = resolve_dump(path.to_owned(), Some(dump_id)).await?;
-            let roots = find_roots(&target, &samples, progress).await?;
+            let roots = find_roots(&target, &samples, skip_stacks, progress).await?;
             target.verify().await?;
             Ok(roots)
         })
@@ -113,7 +118,7 @@ impl DumpAnalyzer {
         .await
     }
 
-    async fn run<T>(
+    pub(crate) async fn run<T>(
         &self,
         analysis: impl Future<Output = Result<T, String>>,
     ) -> Result<Option<T>, String> {
@@ -147,6 +152,7 @@ pub struct DumpAnalysis {
     id: String,
     path: PathBuf,
     duration_ms: u64,
+    reachable_only: bool,
     #[serde(flatten)]
     heap: DumpHeap,
 }
@@ -174,7 +180,16 @@ struct DumpType {
 #[serde(rename_all = "camelCase")]
 pub struct DumpRoots {
     samples_checked: usize,
+    skip_stacks: bool,
     paths: Vec<DumpRootPath>,
+    unrooted: Vec<String>,
+    failures: Vec<DumpRootFailure>,
+}
+
+#[derive(Serialize)]
+struct DumpRootFailure {
+    address: String,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -188,12 +203,20 @@ pub struct DumpObject {
 #[serde(rename_all = "camelCase")]
 struct DumpRootPath {
     address: String,
-    frames: Vec<DumpRootFrame>,
+    #[serde(flatten)]
+    chain: DumpRootChain,
     application_frame_index: Option<usize>,
-    stack_method: Option<String>,
     reference: Option<DumpReference>,
     trace: String,
     trace_truncated: bool,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DumpRootChain {
+    frames: Vec<DumpRootFrame>,
+    root_kind: Option<String>,
+    stack_method: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -213,10 +236,19 @@ pub struct DumpReference {
     fields: Vec<String>,
 }
 
-async fn analyze_file(path: PathBuf, progress: &Channel<String>) -> Result<DumpAnalysis, String> {
+async fn analyze_file(
+    path: PathBuf,
+    reachable_only: bool,
+    progress: &Channel<String>,
+) -> Result<DumpAnalysis, String> {
     let started = Instant::now();
     let target = resolve_dump(path, None).await?;
-    let output = run_sos(&target.tool, &target.path, "dumpheap -stat", Some(progress)).await?;
+    let command = if reachable_only {
+        "dumpheap -stat -live"
+    } else {
+        "dumpheap -stat"
+    };
+    let output = run_sos(&target.tool, &target.path, command, Some(progress)).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -239,6 +271,7 @@ async fn analyze_file(path: PathBuf, progress: &Channel<String>) -> Result<DumpA
         id: target.id,
         path: target.path,
         duration_ms: started.elapsed().as_millis() as u64,
+        reachable_only,
         heap,
     })
 }
@@ -421,10 +454,14 @@ async fn read_sos_output(
 
 fn send_progress(line: &str, progress: Option<&Channel<String>>) -> bool {
     let message = line.trim();
+    if message == "Subsequent runs of this command will be faster." {
+        return true;
+    }
     let lower = message.to_ascii_lowercase();
     if lower.starts_with("scanning heap")
         || lower.starts_with("walking heap")
         || lower.starts_with("caching gc roots")
+        || lower.starts_with("calculating live objects")
         || lower.starts_with("scanned ")
     {
         if let Some(progress) = progress {
@@ -438,11 +475,19 @@ fn send_progress(line: &str, progress: Option<&Channel<String>>) -> bool {
 async fn find_roots(
     target: &DumpTarget,
     samples: &[u64],
+    skip_stacks: bool,
     progress: &Channel<String>,
 ) -> Result<DumpRoots, String> {
     const ROOT_OUTPUT_LIMIT: usize = 256 * 1024;
     let (path, tool) = (&target.path, &target.tool);
-    let mut paths = Vec::new();
+    let mut roots = DumpRoots {
+        samples_checked: samples.len(),
+        skip_stacks,
+        paths: Vec::new(),
+        unrooted: Vec::new(),
+        failures: Vec::new(),
+    };
+    let stack_option = if skip_stacks { " -nostacks" } else { "" };
     let mut use_root_limit = true;
     for (index, address) in samples.iter().enumerate() {
         let _ = progress.send(format!(
@@ -450,9 +495,9 @@ async fn find_roots(
             index + 1,
             samples.len()
         ));
-        let plain_command = format!("gcroot {address:x}");
+        let plain_command = format!("gcroot{stack_option} {address:x}");
         let command = if use_root_limit {
-            format!("gcroot -limit 1 {address:x}")
+            format!("gcroot -limit 1{stack_option} {address:x}")
         } else {
             plain_command.clone()
         };
@@ -482,19 +527,23 @@ async fn find_roots(
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let count = output
-            .status
-            .success()
-            .then(|| root_count(&stdout))
-            .flatten();
-        let count = count.ok_or_else(|| {
-            analysis_error(
-                "dotnet-dump could not complete the GC root search.",
-                &stdout,
-                &stderr,
-            )
-        })?;
-        if count > 0 {
+        let count = root_count(&stdout);
+        let invalid_object = stdout
+            .lines()
+            .chain(stderr.lines())
+            .any(|line| line.contains(" is not a valid object"));
+        if !output.status.success() || count.is_none() || invalid_object {
+            roots.failures.push(DumpRootFailure {
+                address: format!("0x{address:x}"),
+                message: analysis_error(
+                    "dotnet-dump could not complete the GC root search.",
+                    &stdout,
+                    &stderr,
+                ),
+            });
+        } else if count == Some(0) {
+            roots.unrooted.push(format!("0x{address:x}"));
+        } else {
             let mut lines = stdout.lines().skip_while(|line| {
                 let line = line.trim();
                 line.is_empty()
@@ -503,7 +552,8 @@ async fn find_roots(
                     || line.starts_with("Subsequent runs of this command")
             });
             let trace = lines.by_ref().take(160).collect::<Vec<_>>().join("\n");
-            let (frames, stack_method) = root_frames(&stdout, *address);
+            let chain = root_frames(&stdout, *address);
+            let frames = &chain.frames;
             let application_frame_index =
                 frames[..frames.len().saturating_sub(1)]
                     .iter()
@@ -521,21 +571,17 @@ async fn find_roots(
             } else {
                 None
             };
-            paths.push(DumpRootPath {
+            roots.paths.push(DumpRootPath {
                 address: format!("0x{address:x}"),
-                frames,
+                chain,
                 application_frame_index,
-                stack_method,
                 reference,
                 trace: trace.trim_end().to_string(),
                 trace_truncated: output.stdout_truncated || lines.next().is_some(),
             });
         }
     }
-    Ok(DumpRoots {
-        samples_checked: samples.len(),
-        paths,
-    })
+    Ok(roots)
 }
 
 fn gcroot_rejected_arguments(output: &[u8]) -> bool {
@@ -553,13 +599,15 @@ async fn sample_objects(
     path: &Path,
     method_table: u64,
     min_bytes: u64,
+    reachable_only: bool,
     progress: &Channel<String>,
 ) -> Result<Vec<DumpObject>, String> {
     const SAMPLE_LIMIT: usize = 12;
+    let live_option = if reachable_only { " -live" } else { "" };
     let mut child = sos_command(
         tool,
         path,
-        &format!("dumpheap -mt {method_table:x} -min {min_bytes}"),
+        &format!("dumpheap -mt {method_table:x} -min {min_bytes}{live_option}"),
     )
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -583,6 +631,9 @@ async fn sample_objects(
                 table_seen = true;
             }
             if let Some(sample) = parse_object_row(&line, method_table) {
+                if sample.size_bytes < min_bytes {
+                    continue;
+                }
                 samples.push(sample);
                 if samples.len() == SAMPLE_LIMIT {
                     if child.try_wait()?.is_none() {
@@ -633,16 +684,10 @@ fn parse_object_row(line: &str, method_table: u64) -> Option<DumpObject> {
     })
 }
 
-fn root_frames(stdout: &str, target: u64) -> (Vec<DumpRootFrame>, Option<String>) {
-    let mut frames = Vec::new();
-    let mut thread_root = false;
-    let mut stack_method = None;
+fn root_frames(stdout: &str, target: u64) -> DumpRootChain {
+    let mut chain = DumpRootChain::default();
     for line in stdout.lines() {
         let line = line.trim();
-        if line.starts_with("Thread ") || line == "HandleTable:" {
-            thread_root = line.starts_with("Thread ");
-            stack_method = None;
-        }
         if let Some(edge) = line.strip_prefix("->") {
             let Some((address, label)) = edge.trim_start().split_once(char::is_whitespace) else {
                 continue;
@@ -656,22 +701,42 @@ fn root_frames(stdout: &str, target: u64) -> (Vec<DumpRootFrame>, Option<String>
                 .map_or((label, None), |(name, field)| {
                     (name, Some(field.trim_end_matches(')').to_string()))
                 });
-            frames.push(DumpRootFrame {
+            chain.frames.push(DumpRootFrame {
                 address: format!("0x{address:x}"),
                 type_name: type_name.to_string(),
                 static_field,
             });
             if address == target {
-                return (frames, stack_method);
+                return chain;
             }
         } else {
-            frames.clear();
-            if thread_root {
-                stack_method = parse_stack_method(line).or(stack_method);
+            chain.frames.clear();
+            if let Some(thread) = line
+                .strip_prefix("Thread ")
+                .and_then(|rest| rest.strip_suffix(':'))
+            {
+                chain.root_kind = Some(format!("Thread {thread} stack"));
+                chain.stack_method = None;
+            } else if line == "HandleTable:" {
+                chain.root_kind = Some("GC handle".into());
+                chain.stack_method = None;
+            } else if matches!(line, "Finalizer Queue:" | "FinalizerQueue:") {
+                chain.root_kind = Some("Finalizer queue".into());
+                chain.stack_method = None;
+            } else if let Some(kind) = line
+                .split_once(" (")
+                .and_then(|(address, suffix)| parse_address(address).and(suffix.split_once(')')))
+                .map(|(kind, _)| kind)
+                .filter(|kind| kind.ends_with(" handle"))
+            {
+                chain.root_kind = Some(kind.to_string());
+                chain.stack_method = None;
+            } else if let Some(method) = parse_stack_method(line) {
+                chain.stack_method = Some(method);
             }
         }
     }
-    (Vec::new(), None)
+    DumpRootChain::default()
 }
 
 fn parse_stack_method(line: &str) -> Option<String> {
@@ -1034,16 +1099,13 @@ mod tests {
             .unwrap();
             assert_eq!(received, "Scanning heap: 2,000 MB / 20,000 MB (10%)...");
 
-            writer.write_all(b"Statistics:\nMT Count TotalSize Class Name\nabc 2 48 SessionRecord\nTotal 2 objects\n")
+            writer.write_all(b"Subsequent runs of this command will be faster.\nStatistics:\nMT Count TotalSize Class Name\nabc 2 48 SessionRecord\nTotal 2 objects\n")
                 .await.unwrap();
             drop(writer);
             let output = result.await.unwrap().unwrap();
-            assert_eq!(
-                parse_heap(&String::from_utf8(output.bytes).unwrap())
-                    .unwrap()
-                    .object_count,
-                2
-            );
+            let heap = parse_heap(&String::from_utf8(output.bytes).unwrap()).unwrap();
+            assert_eq!(heap.object_count, 2);
+            assert!(heap.notices.is_empty());
         });
     }
 
@@ -1067,7 +1129,9 @@ mod tests {
             assert!(capture.bytes.len() <= 128 + 32);
             let text = String::from_utf8(capture.bytes).unwrap();
             assert_eq!(root_count(&text), Some(20_001));
-            assert_eq!(root_frames(&text, 0xabc).0.len(), 2);
+            let chain = root_frames(&text, 0xabc);
+            assert_eq!(chain.frames.len(), 2);
+            assert_eq!(chain.root_kind.as_deref(), Some("GC handle"));
         });
     }
 
@@ -1077,13 +1141,23 @@ mod tests {
         assert_eq!(object.address, "0xabc");
         assert_eq!(object.size_bytes, 131096);
         assert!(parse_object_row("0000000abc 0000000def 131,096", 0xfff).is_none());
-        let (frames, method) = root_frames(
+        let chain = root_frames(
             "Thread 42:\n 001010 001040 Example.CachedService.Process()\n   rbx:\n   -> 0000000123 Example.CachedService\n   -> 0000000abc System.Byte[]",
             0xabc,
         );
-        assert_eq!(method.as_deref(), Some("Example.CachedService.Process()"));
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].address, "0x123");
+        assert_eq!(
+            chain.stack_method.as_deref(),
+            Some("Example.CachedService.Process()")
+        );
+        assert_eq!(chain.root_kind.as_deref(), Some("Thread 42 stack"));
+        assert_eq!(chain.frames.len(), 2);
+        assert_eq!(chain.frames[0].address, "0x123");
+        let chain = root_frames(
+            "Finalizer Queue:\n  123 (finalizer root)\n  -> 123 Example.Finalizable\n  -> abc Example.Item",
+            0xabc,
+        );
+        assert_eq!(chain.root_kind.as_deref(), Some("Finalizer queue"));
+        assert!(chain.stack_method.is_none());
     }
 
     #[test]
@@ -1114,15 +1188,19 @@ mod tests {
             &tool,
             r#"#!/bin/sh
 case "$4" in
-    'gcroot -limit 1 1dacfc00de8')
+    'gcroot -limit 1 -nostacks 1dacfc00de8')
         printf '%s\n' "Unrecognized command or argument '1'" \
             "Unrecognized command or argument '1dacfc00de8'" \
             'gcroot:' 'Usage:' '  > gcroot [options] [<target>]' >&2
         ;;
-    'gcroot 1dacfc00de8')
-        printf '%s\n' 'HandleTable:' '  -> 000001dacfc00de8 System.Byte[]' 'Found 1 unique roots.'
+    'gcroot -nostacks 1dacfc00de8')
+        printf '%s\n' 'HandleTable:' '  0000012345678900 (pinned handle)' '  -> 000001dacfc00de8 System.Byte[]' 'Found 1 unique roots.'
         ;;
-    'gcroot 2dacfc00de8')
+    'gcroot -nostacks 2dacfc00de8')
+        printf '%s\n' 'Found 0 unique roots.'
+        ;;
+    'gcroot -nostacks 3dacfc00de8')
+        printf '%s\n' 'Warning: 3dacfc00de8 is not a valid object' >&2
         printf '%s\n' 'Found 0 unique roots.'
         ;;
     *) exit 1 ;;
@@ -1139,15 +1217,25 @@ esac
         let progress = Channel::new(|_| Ok(()));
         let result = tauri::async_runtime::block_on(super::find_roots(
             &target,
-            &[0x1dacfc00de8, 0x2dacfc00de8],
+            &[0x1dacfc00de8, 0x2dacfc00de8, 0x3dacfc00de8],
+            true,
             &progress,
         ));
         fs::remove_dir_all(dir).unwrap();
 
         let roots = result.unwrap();
-        assert_eq!(roots.samples_checked, 2);
+        assert_eq!(roots.samples_checked, 3);
+        assert!(roots.skip_stacks);
         assert_eq!(roots.paths.len(), 1);
-        assert_eq!(roots.paths[0].frames[0].address, "0x1dacfc00de8");
+        assert_eq!(roots.paths[0].chain.frames[0].address, "0x1dacfc00de8");
+        assert_eq!(
+            roots.paths[0].chain.root_kind.as_deref(),
+            Some("pinned handle")
+        );
+        assert_eq!(roots.unrooted, ["0x2dacfc00de8"]);
+        assert_eq!(roots.failures.len(), 1);
+        assert_eq!(roots.failures[0].address, "0x3dacfc00de8");
+        assert!(roots.failures[0].message.contains("is not a valid object"));
     }
 
     #[test]

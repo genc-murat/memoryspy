@@ -538,9 +538,13 @@ pub async fn pick_dump(window: tauri::WebviewWindow, kind: Option<String>) -> Re
 pub async fn analyze_dump(
     state: State<'_, AppState>,
     path: String,
+    reachable_only: Option<bool>,
     progress: tauri::ipc::Channel<String>,
 ) -> Result<Option<DumpAnalysis>, String> {
-    state.dump_analyzer.analyze(Path::new(&path), &progress).await
+    state
+        .dump_analyzer
+        .analyze(Path::new(&path), reachable_only.unwrap_or(false), &progress)
+        .await
 }
 
 #[tauri::command]
@@ -550,9 +554,20 @@ pub async fn sample_dump_objects(
     dump_id: String,
     method_table: String,
     min_bytes: u64,
+    reachable_only: Option<bool>,
     progress: tauri::ipc::Channel<String>,
 ) -> Result<Option<Vec<DumpObject>>, String> {
-    state.dump_analyzer.objects(Path::new(&path), &dump_id, &method_table, min_bytes, &progress).await
+    state
+        .dump_analyzer
+        .objects(
+            Path::new(&path),
+            &dump_id,
+            &method_table,
+            min_bytes,
+            reachable_only.unwrap_or(false),
+            &progress,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -561,9 +576,19 @@ pub async fn inspect_dump_roots(
     path: String,
     dump_id: String,
     addresses: Vec<String>,
+    skip_stacks: Option<bool>,
     progress: tauri::ipc::Channel<String>,
 ) -> Result<Option<DumpRoots>, String> {
-    state.dump_analyzer.roots(Path::new(&path), &dump_id, &addresses, &progress).await
+    state
+        .dump_analyzer
+        .roots(
+            Path::new(&path),
+            &dump_id,
+            &addresses,
+            skip_stacks.unwrap_or(false),
+            &progress,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -586,9 +611,22 @@ pub async fn resolve_dump_source(
     method_table: String,
     type_name: String,
     method_name: Option<String>,
-) -> Result<DumpSourceLocation, String> {
-    let identity = crate::dump::module_identity(Path::new(&path), &dump_id, &method_table).await?;
-    dump_source::resolve(&state.location_snapshot(), Path::new(&assembly), &identity, &type_name, method_name.as_deref()).await
+) -> Result<Option<DumpSourceLocation>, String> {
+    state
+        .dump_analyzer
+        .run(async {
+            let identity =
+                crate::dump::module_identity(Path::new(&path), &dump_id, &method_table).await?;
+            dump_source::resolve(
+                &state.location_snapshot(),
+                Path::new(&assembly),
+                &identity,
+                &type_name,
+                method_name.as_deref(),
+            )
+            .await
+        })
+        .await
 }
 
 #[tauri::command]

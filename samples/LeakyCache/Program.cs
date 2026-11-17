@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -7,15 +8,19 @@ using System.Text;
 // Each mode reproduces a different real world memory problem so the tool can be judged on
 // whether it actually points at the right culprit:
 //
-//   cache        a static dictionary that is only ever added to (the classic managed leak)
+//   cache        a dictionary that is only ever added to (the classic managed leak)
 //   loh          large byte arrays that fragment the Large Object Heap
 //   strings      unbounded string accumulation (duplicated keys, log buffers)
 //   churn        no leak at all, just a very high allocation rate
 //   handles      pinned buffers held forever, plus event handlers never unsubscribed
 //   all          everything at once
 //
+// Integration fixtures: cache-counters primes Gen 2 before continuing to allocate.
+// cache-snapshot builds a fixed cache and holds it idle for a heap snapshot.
+//
 // Usage: dotnet MemorySpy.Samples.LeakyCache.dll [mode] [--seconds N]
 
+const int CacheFixtureEntries = 10_000;
 var mode = args.FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal)) ?? "cache";
 var seconds = ParseSeconds(args);
 var deadline = seconds > 0 ? DateTime.UtcNow.AddSeconds(seconds) : DateTime.MaxValue;
@@ -32,8 +37,11 @@ Console.CancelKeyPress += (_, e) =>
 
 var workers = new List<Task>();
 
-if (mode is "cache" or "all")
-    workers.Add(Task.Run(() => RunCache(cancellation.Token)));
+if (mode is "cache" or "all" or "cache-counters")
+    workers.Add(Task.Run(() => RunCache(cancellation.Token, primeCounters: mode == "cache-counters")));
+
+if (mode == "cache-snapshot")
+    workers.Add(Task.Run(() => RunSnapshotCache(cancellation.Token)));
 
 if (mode is "loh" or "all")
     workers.Add(Task.Run(() => RunLargeObjects(cancellation.Token)));
@@ -73,23 +81,49 @@ return 0;
 
 // Never evicted, never bounded: the signature of a managed leak. Objects survive into
 // generation 2, so Gen 2 size climbs while time spent in GC stays low.
-static async Task RunCache(CancellationToken token)
+static async Task RunCache(CancellationToken token, bool primeCounters)
 {
     var cache = new Dictionary<Guid, SessionRecord>();
     var counter = 0;
 
     while (!token.IsCancellationRequested)
     {
-        for (var i = 0; i < 250; i++)
+        AddCacheRecords(cache, ref counter, 250);
+
+        if (primeCounters && counter == CacheFixtureEntries)
         {
-            var id = Guid.NewGuid();
-            cache[id] = new SessionRecord(id, $"session-{counter++}", DateTime.UtcNow, new byte[256]);
+            // Keep the records through two collections so the runtime can report Gen 2
+            // bytes even if its allocation budget would defer collections on this runner.
+            GC.Collect();
+            GC.Collect();
+            Console.WriteLine("cache: ready");
         }
 
         await Task.Delay(5, token).ContinueWith(_ => { }, CancellationToken.None);
     }
 
     Console.WriteLine($"cache: final count = {cache.Count}");
+}
+
+static async Task RunSnapshotCache(CancellationToken token)
+{
+    var cache = new Dictionary<Guid, SessionRecord>();
+    var counter = 0;
+    AddCacheRecords(cache, ref counter, CacheFixtureEntries);
+    Console.WriteLine("cache: ready");
+    await Task.Delay(Timeout.Infinite, token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+    GC.KeepAlive(cache);
+}
+
+// Keep per-record temporaries in a separate frame that has returned before the snapshot.
+[MethodImpl(MethodImplOptions.NoInlining)]
+static void AddCacheRecords(Dictionary<Guid, SessionRecord> cache, ref int counter, int count)
+{
+    for (var i = 0; i < count; i++)
+    {
+        var id = Guid.NewGuid();
+        cache[id] = new SessionRecord(id, $"session-{counter++}", DateTime.UtcNow, new byte[256]);
+    }
 }
 
 // Allocations above 85 KB land on the LOH, which is not compacted by default. Growing it

@@ -12,6 +12,7 @@
 //! cargo test --manifest-path src-tauri/Cargo.toml
 //! ```
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -109,6 +110,10 @@ impl Drop for SampleGuard {
 }
 
 fn spawn_sample() -> Option<SampleGuard> {
+    spawn_cache("cache", Stdio::null())
+}
+
+fn spawn_cache(mode: &str, stdout: Stdio) -> Option<SampleGuard> {
     let dll = sample_dll();
     if !dll.is_file() {
         return None;
@@ -116,14 +121,35 @@ fn spawn_sample() -> Option<SampleGuard> {
 
     let child = Command::new("dotnet")
         .arg(&dll)
-        .arg("cache")
+        .arg(mode)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
 
     Some(SampleGuard(child))
+}
+
+fn spawn_ready_cache(mode: &str) -> SampleGuard {
+    let mut sample = spawn_cache(mode, Stdio::piped())
+        .expect("could not start the sample. Run `npm run sample:build` first");
+    let stdout = sample.0.stdout.take().expect("sample stdout must be piped");
+    let (ready, signal) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let ready_line = BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line == "cache: ready");
+        let _ = ready.send(ready_line);
+    });
+
+    assert_eq!(
+        signal.recv_timeout(Duration::from_secs(10)),
+        Ok(true),
+        "the {mode} sample did not report a ready cache"
+    );
+    sample
 }
 
 /// Number of lines in a file, used to check that a resolved line number lands inside it.
@@ -286,11 +312,7 @@ fn process_listing_finds_the_leaking_sample() {
 
 #[test]
 fn a_live_session_streams_counters_allocations_and_gc_data() {
-    let Some(guard) = spawn_sample() else {
-        panic!("sample not built. Run `npm run sample:build` first");
-    };
-
-    thread::sleep(Duration::from_millis(1500));
+    let guard = spawn_ready_cache("cache-counters");
 
     let location = collector::locate_collector();
     assert_located(&location);
@@ -379,7 +401,7 @@ fn a_live_session_streams_counters_allocations_and_gc_data() {
     // are not required to match exactly — only to be mutually plausible.
     assert!(
         gen2_size > 0.0,
-        "a process that has been accumulating a cache for seconds must have something in Gen 2"
+        "the primed cache must have something in Gen 2"
     );
     assert!(
         heap_size >= gen2_size * 0.75,
@@ -1092,11 +1114,7 @@ fn a_size_capped_capture_still_resolves_call_sites() {
 /// needs no providers at all, because the walk brings its own.
 #[test]
 fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
-    let Some(guard) = spawn_sample() else {
-        panic!("sample not built. Run `npm run sample:build` first");
-    };
-
-    thread::sleep(Duration::from_millis(1500));
+    let guard = spawn_ready_cache("cache-snapshot");
 
     let location = collector::locate_collector();
     assert_located(&location);
@@ -1141,7 +1159,7 @@ fn a_heap_snapshot_names_the_chain_that_keeps_the_leaking_cache_alive() {
         sink.logs.lock().unwrap()
     );
 
-    // A walk of a heap that has been leaking for a couple of seconds is quick, but the collector
+    // A walk of the populated cache is quick, but the collector
     // allows two minutes before it gives up, so the test waits past the collector's own deadline
     // only when something is genuinely wrong.
     assert!(
